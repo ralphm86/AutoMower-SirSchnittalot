@@ -308,6 +308,11 @@ python web_app.py [options]
 | `--password` | _(none)_ | Web UI password (or `AUTH_PASSWORD` env var); auth disabled if omitted |
 | `--secret-key` | random | Session-cookie signing secret (or `SECRET_KEY` env var); set for stable sessions across restarts |
 | `--gps-token` | _(none)_ | Shared secret for GPS ingest (or `GPS_TOKEN` env var), sent as `X-GPS-Token` |
+| `--mqtt-host` | _(none)_ | MQTT broker (or `MQTT_HOST`); enables the Home Assistant bridge |
+| `--mqtt-port` | `1883` | Broker port (or `MQTT_PORT`) |
+| `--mqtt-user` / `--mqtt-password` | _(none)_ | Broker credentials (or `MQTT_USER` / `MQTT_PASSWORD`) |
+| `--mqtt-prefix` | `automower` | Topic prefix (or `MQTT_PREFIX`) |
+| `--mqtt-discovery-prefix` | `homeassistant` | HA discovery prefix (or `MQTT_DISCOVERY_PREFIX`) |
 | `--log-file` | _(none)_ | Also write logs to this rotating file |
 | `--log-max-mb` | `10` | Max size (MB) before the log file rotates |
 | `--log-backups` | `5` | Number of rotated log files to keep |
@@ -342,6 +347,26 @@ An external GPS tracker (e.g. the ESP32 locator) pushes fixes to `POST /api/gps/
 - The token travels in plain HTTP; use it on a trusted LAN only.
 
 ---
+
+## Home Assistant (MQTT)
+
+The app can publish the mower to Home Assistant through MQTT discovery; it stays the only Bluetooth client, so the planner keeps working.
+
+1. In HA, install the **Mosquitto broker** add-on and create a user for the mower.
+2. `pip install -e ".[ha]"`, then start with the broker flags (prefer env vars for the password under systemd):
+
+   ```bash
+   MQTT_PASSWORD=secret python web_app.py --mqtt-host homeassistant.local --mqtt-user mower
+   ```
+
+3. The device appears automatically under **Settings → Devices & services → MQTT**.
+
+**Entities:** a `lawn_mower` (start = mow for the *Mow duration* number, pause, dock = park / cancel session), battery, charging, activity, state, error, planner "Session" and "Next start" (smart mode only), running time, charging cycles, blade wear, Bluetooth link, weather-watchdog status, *Smart planner* and *Weather watchdog* switches, *Resume* and *Park until further notice* buttons, and a *Last HA command* diagnostic sensor.
+
+**Behaviour:**
+- State is pushed from the existing 60 s sampler; the bridge adds no BLE polling. Statistics refresh every 30 min and only while connected.
+- When BLE is idle-sleeping, HA keeps the last known values. A command from HA wakes the link and waits up to 75 s for the reconnect; on failure the reason shows in *Last HA command*.
+- If the app stops, all entities become unavailable (MQTT last-will).
 
 ## Configuration Files
 

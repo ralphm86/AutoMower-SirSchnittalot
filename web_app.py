@@ -130,6 +130,42 @@ def _gps_token_valid(candidate: Optional[str]) -> bool:
 
 _init_gps_token(os.environ.get("GPS_TOKEN"))
 
+# Home Assistant MQTT bridge; stays None (and ha_mqtt is never imported) unless a broker is set.
+_mqtt_cfg: Optional[dict] = None
+_ha_bridge = None
+
+
+def _init_mqtt(
+    host: Optional[str],
+    port: Optional[int] = None,
+    username: Optional[str] = None,
+    password: Optional[str] = None,
+    prefix: Optional[str] = None,
+    discovery_prefix: Optional[str] = None,
+) -> None:
+    global _mqtt_cfg
+    # Merge so CLI flags override env vars one field at a time.
+    merged = dict(_mqtt_cfg or {})
+    for key, value in (
+        ("host", host), ("port", port), ("username", username), ("password", password),
+        ("prefix", prefix), ("discovery_prefix", discovery_prefix),
+    ):
+        if value:
+            merged[key] = value
+    if merged.get("host"):
+        merged.setdefault("port", 1883)
+        _mqtt_cfg = merged
+
+
+_init_mqtt(
+    os.environ.get("MQTT_HOST"),
+    int(os.environ["MQTT_PORT"]) if os.environ.get("MQTT_PORT") else None,
+    os.environ.get("MQTT_USER"),
+    os.environ.get("MQTT_PASSWORD"),
+    os.environ.get("MQTT_PREFIX"),
+    os.environ.get("MQTT_DISCOVERY_PREFIX"),
+)
+
 # ─── Global connection state ──────────────────────────────────────────────────
 _mower: Optional[Mower] = None
 _connected: bool = False
@@ -196,6 +232,31 @@ def _log_event(kind: str, detail: str = "") -> None:
         logger.debug("Event log failed (ignored): %s", exc)
 
 
+async def _read_live_sample() -> Optional[dict]:
+    """Read battery/activity/charging/state/error; None when the core fields are unusable."""
+    battery, activity, charging, state, error_code = await asyncio.gather(
+        _mower.battery_level(),
+        _mower.mower_activity(),
+        _mower.is_charging(),
+        _mower.mower_state(),
+        _mower.command("GetError"),
+        return_exceptions=True,
+    )
+    # GetError is not answered by every model; a failure there must not
+    # cost us the whole sample.
+    if isinstance(error_code, BaseException):
+        error_code = None
+    if not isinstance(battery, int) or not isinstance(activity, MowerActivity):
+        return None
+    return {
+        "battery": battery,
+        "activity": activity,
+        "charging": bool(charging) if not isinstance(charging, BaseException) else False,
+        "state": state if isinstance(state, MowerState) else None,
+        "error_code": error_code or None,
+    }
+
+
 async def _sampler_loop() -> None:
     """
     Background task: record (timestamp, battery, activity, charging) every
@@ -207,31 +268,23 @@ async def _sampler_loop() -> None:
         if not _connected or _mower is None:
             continue
         try:
-            battery, activity, charging, state, error_code = await asyncio.gather(
-                _mower.battery_level(),
-                _mower.mower_activity(),
-                _mower.is_charging(),
-                _mower.mower_state(),
-                _mower.command("GetError"),
-                return_exceptions=True,
-            )
-            # GetError is not answered by every model; a failure there must not
-            # cost us the whole sample.
-            if isinstance(error_code, BaseException):
-                error_code = None
-            if not isinstance(battery, int) or not isinstance(activity, MowerActivity):
+            sample = await _read_live_sample()
+            if sample is None:
                 continue
             await asyncio.to_thread(
                 store.record_sample,
                 int(dt.datetime.now().timestamp()),
-                battery,
-                activity.value,
-                bool(charging) if not isinstance(charging, BaseException) else False,
-                state.value if isinstance(state, MowerState) else None,
-                error_code or None,
+                sample["battery"],
+                sample["activity"].value,
+                sample["charging"],
+                sample["state"].value if sample["state"] is not None else None,
+                sample["error_code"],
                 _SAMPLE_INTERVAL_S,
             )
-            logger.debug("Sampler: battery=%d%% activity=%s", battery, activity.name)
+            logger.debug("Sampler: battery=%d%% activity=%s",
+                         sample["battery"], sample["activity"].name)
+            if _ha_bridge is not None:
+                await _ha_bridge.push_live(sample)
         except Exception as exc:
             logger.debug("Sampler error (ignored): %s", exc)
 
@@ -545,9 +598,12 @@ async def lifespan(app: FastAPI):
         planner.set_startup_event(_startup_connect_done)
         planner.start()
     watchdog.start()  # always running; gated internally by watchdog_enabled flag
+    _start_ha_bridge()
     yield
     # Shutdown
     logger.info("Sir Schnittalot shutdown")
+    if _ha_bridge is not None:
+        await _ha_bridge.stop()
     for t in (_reconnect_task, _sampler_task, _idle_disconnect_task):
         if t:
             t.cancel()
@@ -822,6 +878,40 @@ async def connection_status():
 
 
 # ─── Status ───────────────────────────────────────────────────────────────────
+def _smart_context_text(
+    active_end_dt: Optional[dt.datetime],
+    activity: Optional[MowerActivity],
+    remaining_charging_min: Optional[float],
+) -> str:
+    """Human-readable planner context line shown as "Session" in the UI and HA."""
+    next_planned = planner.get_next_planned_session()
+    if planner._user_inhibited:
+        when = (
+            next_planned["start_dt"].strftime("%a %-d %b at %H:%M")
+            if next_planned else "no sessions planned"
+        )
+        return f"Parked by user — next session ({when}) will be skipped until you Resume"
+    if active_end_dt is not None:
+        mins_left = max(0, int((active_end_dt - dt.datetime.now()).total_seconds() / 60))
+        if activity == MowerActivity.CHARGING:
+            if remaining_charging_min is not None:
+                resume_dt = dt.datetime.now() + dt.timedelta(minutes=remaining_charging_min)
+                return (
+                    f"Charging until ~{resume_dt.strftime('%H:%M')}"
+                    f" — mowing until {active_end_dt.strftime('%H:%M')}"
+                )
+            return f"Charging — mowing until {active_end_dt.strftime('%H:%M')}"
+        return f"Mowing until {active_end_dt.strftime('%H:%M')} ({mins_left} min left)"
+    if next_planned:
+        start = next_planned["start_dt"]
+        return (
+            f"Next: {next_planned['dow_name']} {start.strftime('%-d %b')}"
+            f" at {start.strftime('%H:%M')}"
+            f" ({next_planned['duration_sec'] // 60} min)"
+        )
+    return "No sessions planned — run planner"
+
+
 @app.get("/api/status")
 async def get_status():
     """Query all relevant status information from the mower."""
@@ -921,39 +1011,7 @@ async def get_status():
                 if ov_end > dt.datetime.now():
                     active_end_dt = ov_end
 
-        if planner._user_inhibited:
-            _next_planned = planner.get_next_planned_session()
-            _when = (
-                _next_planned["start_dt"].strftime("%a %-d %b at %H:%M")
-                if _next_planned else "no sessions planned"
-            )
-            smart_context = f"Parked by user — next session ({_when}) will be skipped until you Resume"
-        elif active_end_dt is not None:
-            mins_left = max(0, int((active_end_dt - dt.datetime.now()).total_seconds() / 60))
-            if activity == MowerActivity.CHARGING:
-                if remaining_charging_min is not None:
-                    resume_dt = dt.datetime.now() + dt.timedelta(minutes=remaining_charging_min)
-                    smart_context = (
-                        f"Charging until ~{resume_dt.strftime('%H:%M')}"
-                        f" — mowing until {active_end_dt.strftime('%H:%M')}"
-                    )
-                else:
-                    smart_context = (
-                        f"Charging — mowing until {active_end_dt.strftime('%H:%M')}"
-                    )
-            else:
-                smart_context = (
-                    f"Mowing until {active_end_dt.strftime('%H:%M')} ({mins_left} min left)"
-                )
-        elif _next_planned:
-            start = _next_planned["start_dt"]
-            smart_context = (
-                f"Next: {_next_planned['dow_name']} {start.strftime('%-d %b')}"
-                f" at {start.strftime('%H:%M')}"
-                f" ({_next_planned['duration_sec'] // 60} min)"
-            )
-        else:
-            smart_context = "No sessions planned — run planner"
+        smart_context = _smart_context_text(active_end_dt, activity, remaining_charging_min)
 
     return {
         "connected": True,
@@ -1725,14 +1783,18 @@ async def set_planner_config(req: PlannerConfigRequest):
     cfg["last_plan_result"] = existing.get("last_plan_result")
     planner_save_config(cfg)
 
-    # Start or stop background agent based on new enabled state
-    if cfg["enabled"]:
+    await _apply_planner_enabled(cfg["enabled"])
+
+    return {"status": "ok", "enabled": cfg["enabled"]}
+
+
+async def _apply_planner_enabled(enabled: bool) -> None:
+    """Start or stop the background agent to match the saved `enabled` flag."""
+    if enabled:
         if not planner.is_running():
             planner.start()
     else:
         await planner.stop()
-
-    return {"status": "ok", "enabled": cfg["enabled"]}
 
 
 @app.post("/api/planner/run")
@@ -2035,6 +2097,125 @@ async def watchdog_check_now():
     return {"status": "ok", "result": result}
 
 
+# ─── Home Assistant bridge wiring ─────────────────────────────────────────────
+def _ha_wake() -> None:
+    global _ble_idle_suspend
+    _ble_idle_suspend = False
+
+
+def _ha_address() -> Optional[str]:
+    if _mower is not None:
+        return _mower.address
+    return _reconnect_cfg.get("address") if _reconnect_cfg else None
+
+
+async def _ha_read_identity() -> dict:
+    name, serial, manufacturer, model = await asyncio.gather(
+        _mower.command("GetUserMowerNameAsAsciiString"),
+        _mower.command("GetSerialNumber"),
+        _mower.get_manufacturer(),
+        _mower.get_model(),
+        return_exceptions=True,
+    )
+
+    def ok(v):
+        return None if isinstance(v, BaseException) else v
+
+    return {"name": ok(name), "serial": ok(serial),
+            "manufacturer": ok(manufacturer), "model": ok(model)}
+
+
+async def _ha_read_live() -> Optional[dict]:
+    if not _connected or _mower is None:
+        return None
+    return await _read_live_sample()
+
+
+async def _ha_read_stats() -> Optional[dict]:
+    try:
+        return await get_statistics()
+    except HTTPException:
+        return None
+
+
+def _ha_planner_snapshot() -> dict:
+    """Planner and watchdog state; reads no BLE, so it is safe while the link sleeps."""
+    cfg = planner_load_config()
+    enabled = bool(cfg.get("enabled"))
+    smart_context = None
+    next_start = None
+    if enabled:
+        active_end = (
+            planner._active_session["start_dt"]
+            + dt.timedelta(seconds=planner._active_session["duration_sec"])
+            if planner._active_session else None
+        )
+        smart_context = _smart_context_text(active_end, None, None)
+        nxt = planner.get_next_planned_session()
+        if nxt and not planner._active_session:
+            next_start = nxt["start_dt"].astimezone().isoformat()
+    return {
+        "planner_enabled": enabled,
+        "watchdog_enabled": bool(cfg.get("watchdog_enabled")),
+        "watchdog_parked": watchdog._parked_by_watchdog,
+        "watchdog_status": watchdog.last_status,
+        "smart_context": smart_context,
+        "next_start": next_start,
+    }
+
+
+async def _ha_run_command(name: str, args: dict) -> str:
+    handlers = {
+        "mow": lambda: command_mow(MowRequest(**args)),
+        "pause": command_pause,
+        "resume": command_resume,
+        "park": command_park,
+        "park_home": command_park_home,
+    }
+    try:
+        result = await handlers[name]()
+    except HTTPException as exc:
+        raise RuntimeError(exc.detail) from exc
+    return result.get("message", "ok")
+
+
+async def _ha_set_planner_enabled(enabled: bool) -> None:
+    cfg = planner_load_config()
+    cfg["enabled"] = enabled
+    planner_save_config(cfg)
+    await _apply_planner_enabled(enabled)
+
+
+def _ha_set_watchdog_enabled(enabled: bool) -> None:
+    cfg = planner_load_config()
+    cfg["watchdog_enabled"] = enabled
+    planner_save_config(cfg)
+
+
+def _start_ha_bridge() -> None:
+    global _ha_bridge
+    if _mqtt_cfg is None or _ha_bridge is not None:
+        return
+    import ha_mqtt  # deferred: aiomqtt is an optional dependency
+
+    hooks = ha_mqtt.Hooks(
+        is_connected=lambda: _connected and _mower is not None,
+        wake=_ha_wake,
+        address=_ha_address,
+        read_identity=_ha_read_identity,
+        read_live=_ha_read_live,
+        read_stats=_ha_read_stats,
+        planner_snapshot=_ha_planner_snapshot,
+        run_command=_ha_run_command,
+        set_planner_enabled=_ha_set_planner_enabled,
+        set_watchdog_enabled=_ha_set_watchdog_enabled,
+    )
+    _ha_bridge = ha_mqtt.HaBridge(ha_mqtt.MqttConfig(**_mqtt_cfg), hooks)
+    _ha_bridge.start()
+    logger.info("Home Assistant MQTT bridge enabled (broker %s:%s)",
+                _mqtt_cfg["host"], _mqtt_cfg["port"])
+
+
 # ─── Entry point ──────────────────────────────────────────────────────────────
 _APP_LOGGERS = ("web_app", "automower_ble", "planner", "uvicorn", "uvicorn.error", "uvicorn.access")
 
@@ -2131,6 +2312,24 @@ if __name__ == "__main__":
              "header (or set GPS_TOKEN env var). Lets it post fixes without a login.",
     )
     parser.add_argument(
+        "--mqtt-host",
+        default=None,
+        help="MQTT broker host (or MQTT_HOST env var). Enables the Home Assistant "
+             "bridge; requires the 'ha' extra (pip install -e \".[ha]\").",
+    )
+    parser.add_argument("--mqtt-port", type=int, default=None,
+                        help="MQTT broker port (or MQTT_PORT; default 1883).")
+    parser.add_argument("--mqtt-user", default=None,
+                        help="MQTT username (or MQTT_USER env var).")
+    parser.add_argument("--mqtt-password", default=None,
+                        help="MQTT password (or MQTT_PASSWORD env var).")
+    parser.add_argument("--mqtt-prefix", default=None,
+                        help="Topic prefix for state/command topics (or MQTT_PREFIX; "
+                             "default 'automower').")
+    parser.add_argument("--mqtt-discovery-prefix", default=None,
+                        help="Home Assistant discovery prefix (or MQTT_DISCOVERY_PREFIX; "
+                             "default 'homeassistant').")
+    parser.add_argument(
         "--log-file",
         default=None,
         metavar="PATH",
@@ -2159,6 +2358,10 @@ if __name__ == "__main__":
         args.secret_key or os.environ.get("SECRET_KEY"),
     )
     _init_gps_token(args.gps_token)
+    _init_mqtt(
+        args.mqtt_host, args.mqtt_port, args.mqtt_user, args.mqtt_password,
+        args.mqtt_prefix, args.mqtt_discovery_prefix,
+    )
     if _auth_hash is None:
         logging.warning(
             "No --password set: web UI is unprotected. "

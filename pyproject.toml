@@ -33,6 +33,11 @@ test = [
   "itsdangerous",
   "jinja2",
   "python-multipart",      # FastAPI form parsing for /login
+  "aiomqtt",
+]
+# Home Assistant MQTT bridge. Install with:  pip install -e ".[ha]"
+ha = [
+  "aiomqtt",
 ]
 # UI / browser tests (Playwright). After install run: playwright install chromium
 ui = [
