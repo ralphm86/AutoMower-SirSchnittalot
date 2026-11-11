@@ -29,6 +29,7 @@ import uvicorn  # noqa: E402
 from playwright.sync_api import sync_playwright  # noqa: E402
 
 import planner as planner_mod  # noqa: E402
+import store  # noqa: E402
 import web_app  # noqa: E402
 
 TODAY = dt.date.today()
@@ -116,15 +117,15 @@ def write_demo_files(tmp: Path) -> None:
         "adaptive_peak_interval_days": 2,
     }
     (tmp / "planner_config.json").write_text(json.dumps(cfg, indent=2))
-    history = {}
+    db = tmp / "automower.db"
+    store.init_db(db, import_legacy=False)
     for off in range(-14, 0):
         day = TODAY + dt.timedelta(days=off)
         if off in (-8, -7, -6, -5, -4, -3):  # dormant dry spell, no mowing
             continue
         sec = 3 * 3600 if off % 2 == 0 else int(2.5 * 3600)
-        history[day.isoformat()] = {"mow_sec": sec, "complete": True,
-                                    "last_updated": f"{day.isoformat()}T12:00:00"}
-    (tmp / "mow_history.json").write_text(json.dumps(history, indent=2))
+        store.record_mowing_day(day, sec)
+    store.close_db()
     (tmp / "planned_sessions.json").write_text("[]")
     (tmp / "plan_log.json").write_text("[]")
 
@@ -190,7 +191,9 @@ def main() -> None:
     tmp = Path(tempfile.mkdtemp(prefix="automower-demo-"))
     write_demo_files(tmp)
     planner_mod.CONFIG_PATH = tmp / "planner_config.json"
-    planner_mod.MOW_HISTORY_PATH = tmp / "mow_history.json"
+    _init_db = store.init_db
+    # The app's lifespan calls store.init_db() with no args; point it at the demo DB.
+    store.init_db = lambda *a, **k: _init_db(tmp / "automower.db", import_legacy=False)
     planner_mod.PLANNED_SESSIONS_PATH = tmp / "planned_sessions.json"
     planner_mod.PLAN_LOG_PATH = tmp / "plan_log.json"
     planner_mod.fetch_forecast = _fake_fetch

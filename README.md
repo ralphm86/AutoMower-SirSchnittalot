@@ -17,7 +17,7 @@
 
 Developed and tested against an **Automower 305**. Should work on all Automowers; reports for other models are welcome.
 
-> The repository, the Python package (`automower_ble`) and the CLI tools keep the technical name **AutoMower-BLE**.
+> Formerly called *AutoMower-BLE*. The Python package keeps its technical name `automower_ble`, so imports and `python -m automower_ble.mower` are unchanged.
 
 Details on the reverse-engineering process: https://www.alistair23.me/2024/01/06/reverse-engineering-automower-ble
 
@@ -202,8 +202,8 @@ The **Statistics** tab includes a runtime estimator that learns from observed ba
 ### Quick Start (local machine)
 
 ```bash
-git clone https://github.com/your-repo/AutoMower-BLE.git
-cd AutoMower-BLE
+git clone https://github.com/your-repo/sir-schnittalot.git
+cd sir-schnittalot
 
 python3.12 -m venv .venv
 source .venv/bin/activate
@@ -239,8 +239,8 @@ sudo systemctl start bluetooth
 
 # 3. Deploy project
 cd /home/pi
-git clone https://github.com/your-repo/AutoMower-BLE.git   # or scp from your dev machine
-cd AutoMower-BLE
+git clone https://github.com/your-repo/sir-schnittalot.git   # or scp from your dev machine
+cd sir-schnittalot
 
 # 4. Virtual environment
 python3.12 -m venv .venv
@@ -261,18 +261,18 @@ The web UI is reachable at **http://\<pi-ip\>:8080** from any device on your net
 #### Run on boot (systemd)
 
 ```bash
-sudo nano /etc/systemd/system/automower.service
+sudo nano /etc/systemd/system/schnittalot.service
 ```
 
 ```ini
 [Unit]
-Description=AutoMower BLE Web Interface
+Description=Sir Schnittalot Web Interface
 After=bluetooth.target network.target
 
 [Service]
 User=pi
-WorkingDirectory=/home/pi/AutoMower-BLE
-ExecStart=/home/pi/AutoMower-BLE/.venv/bin/python web_app.py --host 0.0.0.0 --port 8080
+WorkingDirectory=/home/pi/sir-schnittalot
+ExecStart=/home/pi/sir-schnittalot/.venv/bin/python web_app.py --host 0.0.0.0 --port 8080
 # Optional: protect with a password
 # Environment=AUTH_PASSWORD=yourpassword
 # Optional: stable session tokens across restarts (otherwise sessions expire on restart)
@@ -307,6 +307,7 @@ python web_app.py [options]
 | `--log-level` | `info` | `debug` / `info` / `warning` / `error` |
 | `--password` | _(none)_ | Web UI password (or `AUTH_PASSWORD` env var); auth disabled if omitted |
 | `--secret-key` | random | Session-cookie signing secret (or `SECRET_KEY` env var); set for stable sessions across restarts |
+| `--gps-token` | _(none)_ | Shared secret for GPS ingest (or `GPS_TOKEN` env var), sent as `X-GPS-Token` |
 | `--log-file` | _(none)_ | Also write logs to this rotating file |
 | `--log-max-mb` | `10` | Max size (MB) before the log file rotates |
 | `--log-backups` | `5` | Number of rotated log files to keep |
@@ -329,6 +330,16 @@ The web UI can be protected with a single password. When enabled, all routes (ex
 - Session cookie is `HttpOnly`, `SameSite=Lax`, 8 hours max-age, signed with `itsdangerous`
 - Per-IP rate-limiting: 5 failed attempts per 5 minutes
 - If `--password` is **not** set, auth is disabled and a warning is logged (suitable for trusted LAN use)
+
+### GPS tracker ingest
+
+An external GPS tracker (e.g. the ESP32 locator) pushes fixes to `POST /api/gps/update` (one fix) or `POST /api/gps/batch` (`{"fixes": [...]}`, 1-500 fixes, each `ts`, `lat`, `lon`, optional `accuracy_m`). The server must listen on a reachable interface (`--host 0.0.0.0`).
+
+- A tracker has no login cookie, so set `--gps-token <secret>` (or `GPS_TOKEN`) and have it send the `X-GPS-Token` header. The token is accepted on these two paths only and bypasses the password check there.
+- Without a token, the ingest endpoints follow the normal web auth; with web auth disabled **and** a token configured, the token is still mandatory.
+- Fixes are validated (lat/lon range, `accuracy_m >= 0`, `ts` between 2020-01-01 and now + 1 h); a batch is rejected as a whole if one fix is invalid.
+- Ingest requests do not count as web activity, so a tracker does not keep BLE polling awake.
+- The token travels in plain HTTP; use it on a trusted LAN only.
 
 ---
 
@@ -388,7 +399,7 @@ python mower_test_cli.py
 
 ```
 ┌─────────────────────────────────────────────────────────┐
-│                  AutoMower-BLE Stack                    │
+│                 Sir Schnittalot Stack                   │
 │                                                         │
 │  Browser  ──HTTP──►  web_app.py  (FastAPI / uvicorn)   │
 │                           │                             │

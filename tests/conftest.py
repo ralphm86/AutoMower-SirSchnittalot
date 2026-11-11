@@ -1,5 +1,5 @@
 """
-Shared pytest fixtures for the AutoMower-BLE test suite.
+Shared pytest fixtures for the Sir Schnittalot test suite.
 
 The web-app and planner tests never touch real Bluetooth hardware: the BLE
 ``Mower`` object is replaced with an ``AsyncMock`` and the FastAPI app is driven
@@ -10,6 +10,22 @@ import datetime as dt
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+
+
+# ─── Session store isolation ──────────────────────────────────────────────────
+@pytest.fixture(autouse=True)
+def isolated_store(tmp_path):
+    """
+    Point the session store at a fresh temp database for every test.
+
+    Autouse because mow history, runtime samples and GPS coverage all read
+    through it — without this the suite would touch the real automower.db.
+    """
+    import store
+
+    store.init_db(tmp_path / "test.db", import_legacy=False)
+    yield store
+    store.close_db()
 
 
 # ─── BLE mower double ─────────────────────────────────────────────────────────

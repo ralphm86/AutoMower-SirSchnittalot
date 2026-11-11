@@ -1,5 +1,5 @@
 """
-Browser / HTML-layer tests for the AutoMower-BLE web UI (templates/index.html).
+Browser / HTML-layer tests for the Sir Schnittalot web UI (templates/index.html).
 
 These drive the real page in a headless browser via Playwright. A live uvicorn
 server runs in a background thread with auth disabled; all ``/api/*`` calls are

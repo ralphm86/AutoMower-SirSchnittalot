@@ -1,5 +1,5 @@
 """
-Web interface for Husqvarna Automower BLE control.
+Sir Schnittalot — web interface for Husqvarna Automower control.
 
 Usage:
     python web_app.py [--host 127.0.0.1] [--port 8080] [--log-level info]
@@ -7,7 +7,7 @@ Usage:
 Then open http://127.0.0.1:8080 in your browser.
 """
 
-# Copyright: AutoMower-BLE contributors
+# Copyright: Sir Schnittalot contributors
 
 import argparse
 import asyncio
@@ -28,7 +28,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 import bcrypt
 from itsdangerous import BadSignature, SignatureExpired, URLSafeTimedSerializer
-from pydantic import BaseModel
+from pydantic import BaseModel, Field, field_validator
 import subprocess
 from bleak import BleakScanner
 
@@ -49,11 +49,10 @@ from planner import (
     save_config as planner_save_config,
     DEFAULT_CONFIG as PLANNER_DEFAULT_CONFIG,
     geocode_city,
-    record_mowing_day,
     get_mow_sec_today,
     load_mow_history,
-    save_mow_history,
 )
+import store
 
 logger = logging.getLogger("web_app")
 
@@ -110,6 +109,27 @@ def _record_failed_attempt(ip: str) -> None:
 # Initialise from environment variables so `uvicorn web_app:app` works too.
 _init_auth(os.environ.get("AUTH_PASSWORD"), os.environ.get("SECRET_KEY"))
 
+# Shared secret for the on-mower GPS controller, which cannot hold a login cookie.
+# When set, the ingest endpoints accept it in the X-GPS-Token header.
+_gps_token: Optional[str] = None
+_GPS_TOKEN_HEADER = "x-gps-token"
+_GPS_INGEST_PATHS = frozenset({"/api/gps/update", "/api/gps/batch"})
+
+
+def _init_gps_token(token: Optional[str]) -> None:
+    global _gps_token
+    if token:
+        _gps_token = token
+
+
+def _gps_token_valid(candidate: Optional[str]) -> bool:
+    if not _gps_token or not candidate:
+        return False
+    return secrets.compare_digest(candidate.encode(), _gps_token.encode())
+
+
+_init_gps_token(os.environ.get("GPS_TOKEN"))
+
 # ─── Global connection state ──────────────────────────────────────────────────
 _mower: Optional[Mower] = None
 _connected: bool = False
@@ -127,19 +147,13 @@ _reconnect_task: Optional[asyncio.Task] = None
 _startup_connect_done: Optional[asyncio.Event] = None
 
 # ─── Runtime sampler ──────────────────────────────────────────────────────────
-_SAMPLES_PATH = Path("runtime_samples.json")
-_MAX_SAMPLES = 2000       # ≈ 33 h at 60 s intervals
+_MAX_SAMPLES = 2000       # window handed to the estimator (≈ 33 h at 60 s)
 _SAMPLE_INTERVAL_S = 60
 
-_runtime_samples: list[dict] = []
 _sampler_task: Optional[asyncio.Task] = None
 
-# ─── Mow session tracking ────────────────────────────────────────────────────
-# Track the start of the current mowing session so completed runs are written
-# to mow_history.json for accurate planner seed-date and progress deduction.
-_mow_session_start_ts: Optional[float] = None  # epoch when current mow started
-_mow_session_date: Optional[dt.date] = None     # date the current session started
-_prev_sample_activity: Optional[int] = None     # previous sample's activity.value
+# Session tracking now lives in store.py: the sampler feeds it each tick and it
+# opens/closes session rows itself, so no session state is held in this module.
 
 # ─── BLE idle sleep ───────────────────────────────────────────────────────────
 # Disconnect BLE automatically when no web user has been active for a while
@@ -170,128 +184,53 @@ def _save_reconnect_state() -> None:
     ))
 
 
-def _load_runtime_samples() -> None:
-    """Load persisted battery/activity samples from disk into memory."""
-    global _runtime_samples
-    if _SAMPLES_PATH.exists():
-        try:
-            data = json.loads(_SAMPLES_PATH.read_text())
-            _runtime_samples = data.get("samples", [])[-_MAX_SAMPLES:]
-            logger.info("Loaded %d runtime samples from %s", len(_runtime_samples), _SAMPLES_PATH)
-        except Exception as exc:
-            logger.warning("Could not load runtime samples: %s", exc)
-
-
-def _save_runtime_samples() -> None:
-    """Persist runtime samples to disk atomically (compact JSON, no indent)."""
+def _log_event(kind: str, detail: str = "") -> None:
+    """
+    Append a timeline event, never letting a bookkeeping failure break the
+    command that triggered it.  The write is a single indexed INSERT, so it is
+    safe to call directly from the event loop.
+    """
     try:
-        _SAMPLES_PATH.write_text(
-            json.dumps({"samples": _runtime_samples[-_MAX_SAMPLES:]}, separators=(",", ":"))
-        )
+        store.record_event(kind, detail)
     except Exception as exc:
-        logger.warning("Failed to save runtime samples: %s", exc)
-
-
-def _rebuild_mow_history_from_samples() -> None:
-    """
-    Scan in-memory runtime samples for completed mowing segments and write
-    them to mow_history.json.  Called once at startup to recover any sessions
-    that were not recorded due to a crash or BLE idle-sleep disconnect.
-
-    Only updates history entries where the sample-derived total exceeds what
-    is already on record (never overwrites richer history with less data).
-    """
-    if not _runtime_samples:
-        return
-    history = load_mow_history()
-    day_mow: dict[str, int] = {}   # date_str → mow seconds from samples
-    mow_val = MowerActivity.MOWING.value
-    seg_start: Optional[int] = None
-    seg_date: Optional[dt.date] = None
-    prev_act: Optional[int] = None
-
-    for s in _runtime_samples:
-        act_val: int = s["activity"]
-        ts: int = s["ts"]
-        if act_val == mow_val and prev_act != mow_val:
-            seg_start = ts
-            seg_date = dt.datetime.fromtimestamp(ts).date()
-        elif act_val != mow_val and prev_act == mow_val:
-            if seg_start is not None and seg_date is not None:
-                dur = ts - seg_start
-                date_str = seg_date.isoformat()
-                day_mow[date_str] = day_mow.get(date_str, 0) + dur
-            seg_start = None
-            seg_date = None
-        prev_act = act_val
-    # An open segment at the end of samples is intentionally left out — the
-    # sampler loop will write it when the session ends.
-
-    updated = False
-    for date_str, sample_sec in day_mow.items():
-        existing = history.get(date_str, {}).get("mow_sec", 0)
-        if sample_sec > existing:
-            history[date_str] = {
-                "mow_sec": sample_sec,
-                "complete": False,
-                "last_updated": dt.datetime.now().isoformat(timespec="seconds"),
-            }
-            logger.info(
-                "Mow history backfilled from samples: %s = %ds", date_str, sample_sec,
-            )
-            updated = True
-    if updated:
-        save_mow_history(history)
+        logger.debug("Event log failed (ignored): %s", exc)
 
 
 async def _sampler_loop() -> None:
-    """Background task: record (timestamp, battery, activity, charging) every minute."""
-    global _runtime_samples, _mow_session_start_ts, _mow_session_date, _prev_sample_activity
+    """
+    Background task: record (timestamp, battery, activity, charging) every
+    minute into the session store, which opens, updates and closes the
+    corresponding mowing session row as the activity changes.
+    """
     while True:
         await asyncio.sleep(_SAMPLE_INTERVAL_S)
         if not _connected or _mower is None:
             continue
         try:
-            battery, activity, charging = await asyncio.gather(
+            battery, activity, charging, state, error_code = await asyncio.gather(
                 _mower.battery_level(),
                 _mower.mower_activity(),
                 _mower.is_charging(),
+                _mower.mower_state(),
+                _mower.command("GetError"),
+                return_exceptions=True,
             )
-            if battery is None or activity is None:
+            # GetError is not answered by every model; a failure there must not
+            # cost us the whole sample.
+            if isinstance(error_code, BaseException):
+                error_code = None
+            if not isinstance(battery, int) or not isinstance(activity, MowerActivity):
                 continue
-            sample_ts = int(dt.datetime.now().timestamp())
-            act_val = activity.value
-            mow_val = MowerActivity.MOWING.value
-
-            # Detect mowing session start
-            if act_val == mow_val and _prev_sample_activity != mow_val:
-                _mow_session_start_ts = float(sample_ts)
-                _mow_session_date = dt.date.today()
-                logger.debug("Sampler: mowing session started on %s", _mow_session_date)
-
-            # Detect mowing session end
-            elif act_val != mow_val and _prev_sample_activity == mow_val:
-                if _mow_session_start_ts is not None and _mow_session_date is not None:
-                    duration_sec = sample_ts - int(_mow_session_start_ts)
-                    if duration_sec >= 60:
-                        record_mowing_day(_mow_session_date, duration_sec, complete=True)
-                        logger.info(
-                            "Sampler: mowing session ended — %.0f min on %s",
-                            duration_sec / 60, _mow_session_date,
-                        )
-                _mow_session_start_ts = None
-                _mow_session_date = None
-
-            _prev_sample_activity = act_val
-            _runtime_samples.append({
-                "ts": sample_ts,
-                "battery": battery,
-                "activity": act_val,
-                "charging": bool(charging),
-            })
-            if len(_runtime_samples) > _MAX_SAMPLES:
-                _runtime_samples = _runtime_samples[-_MAX_SAMPLES:]
-            _save_runtime_samples()
+            await asyncio.to_thread(
+                store.record_sample,
+                int(dt.datetime.now().timestamp()),
+                battery,
+                activity.value,
+                bool(charging) if not isinstance(charging, BaseException) else False,
+                state.value if isinstance(state, MowerState) else None,
+                error_code or None,
+                _SAMPLE_INTERVAL_S,
+            )
             logger.debug("Sampler: battery=%d%% activity=%s", battery, activity.name)
         except Exception as exc:
             logger.debug("Sampler error (ignored): %s", exc)
@@ -356,10 +295,10 @@ async def _idle_disconnect_loop() -> None:
                 activity.name if activity else "unknown",
             )
             _ble_idle_suspend = True
-            await _cleanup_connection()
+            await _cleanup_connection("idle sleep")
 
 
-async def _cleanup_connection() -> None:
+async def _cleanup_connection(reason: str = "") -> None:
     """Disconnect from the mower and clear global state.
 
     Must be called instead of bare ``_mower = None`` assignments so the
@@ -385,6 +324,7 @@ async def _cleanup_connection() -> None:
         except Exception as exc:
             logger.debug("bluetoothctl cleanup failed: %s", exc)
         logger.info("Cleanup: mower %s disconnected", m.address)
+        _log_event("disconnect", reason)
 
 
 async def _reconnect_loop() -> None:
@@ -416,7 +356,7 @@ async def _reconnect_loop() -> None:
             # down and bleak-retry-connector stops auto-reconnecting at the OS level.
             if _connected and (_mower is None or not _mower.is_connected()):
                 logger.info("Auto-reconnect: detected unexpected disconnect")
-                await _cleanup_connection()
+                await _cleanup_connection("link lost")
 
             if _connected:
                 continue  # already connected
@@ -503,6 +443,7 @@ async def _reconnect_loop() -> None:
                     _mower = candidate
                     _connected = True
                     logger.info("Auto-reconnect: connected to %s ✓", addr)
+                    _log_event("connect", "auto-reconnect")
                     # Sync clock
                     try:
                         await _mower.set_time()
@@ -540,10 +481,10 @@ planner.set_mower_provider(lambda: _mower)
 def _learned_cycle_data() -> Optional[dict]:
     """
     Derive avg_mow_h / avg_chg_h from the observed battery discharge/charge
-    rates in *_runtime_samples*.  Returns None when there is not enough sample
+    rates in the stored samples.  Returns None when there is not enough sample
     history to compute reliable rates.
     """
-    rates = _analyse_samples(_runtime_samples)
+    rates = _analyse_samples(store.recent_samples(_MAX_SAMPLES))
     dr = rates["discharge_rate_pct_per_h"]
     cr = rates["charge_rate_pct_per_h"]
     th = rates["return_threshold_pct"]
@@ -557,11 +498,9 @@ def _learned_cycle_data() -> Optional[dict]:
 
 
 planner.set_cycle_data_provider(_learned_cycle_data)
-planner.set_mow_today_provider(lambda: get_mow_sec_today() + (
-    int(time.time() - _mow_session_start_ts)
-    if _mow_session_start_ts is not None and _mow_session_date == dt.date.today()
-    else 0
-))
+# The store keeps the open session's mow_sec rollup up to date on every sampler
+# tick, so today's total already includes any session still in progress.
+planner.set_mow_today_provider(get_mow_sec_today)
 
 watchdog = WeatherWatchdog()
 watchdog.set_mower_provider(lambda: _mower)
@@ -578,8 +517,9 @@ async def lifespan(app: FastAPI):
     _configure_app_logging(_log_level_str, _log_file, _log_max_mb, _log_backups)
     # Startup
     _load_reconnect_state()
-    _load_runtime_samples()
-    _rebuild_mow_history_from_samples()
+    store.init_db()
+    store.close_stale_sessions()
+    store.prune()
     _last_web_activity = time.time()  # treat server start as recent activity
     # Startup connect event: signals the planner when the first reconnect
     # attempt is done so it doesn't try to push before the mower is reachable.
@@ -592,14 +532,14 @@ async def lifespan(app: FastAPI):
     _idle_disconnect_task = asyncio.create_task(_idle_disconnect_loop())
     cfg = planner_load_config()
     logger.info(
-        "═══ AutoMower-BLE starting ═══  "
+        "═══ Sir Schnittalot starting ═══  "
         "auth=%s  planner=%s  watchdog=%s  "
         "reconnect_target=%s  samples=%d",
         "on" if _auth_hash else "off",
         "enabled" if cfg.get("enabled") else "disabled",
         "enabled" if cfg.get("watchdog_enabled") else "disabled",
         _reconnect_cfg.get("address") if _reconnect_cfg else "none",
-        len(_runtime_samples),
+        len(store.recent_samples(_MAX_SAMPLES)),
     )
     if cfg.get("enabled"):
         planner.set_startup_event(_startup_connect_done)
@@ -607,12 +547,13 @@ async def lifespan(app: FastAPI):
     watchdog.start()  # always running; gated internally by watchdog_enabled flag
     yield
     # Shutdown
-    logger.info("AutoMower-BLE shutdown")
+    logger.info("Sir Schnittalot shutdown")
     for t in (_reconnect_task, _sampler_task, _idle_disconnect_task):
         if t:
             t.cancel()
     await planner.stop()
     await watchdog.stop()
+    store.close_db()
 
 
 app = FastAPI(title="Sir Schnittalot", lifespan=lifespan)
@@ -625,13 +566,22 @@ async def _auth_middleware(request: Request, call_next):
     """Gate every route behind the session cookie when auth is enabled."""
     global _last_web_activity, _ble_idle_suspend
     path = request.url.path
+    is_ingest = request.method == "POST" and path in _GPS_INGEST_PATHS
     # Record web activity for BLE idle sleep on any non-static request.
-    # This covers both authenticated API calls and plain page loads.
-    if not path.startswith("/static/"):
+    # This covers both authenticated API calls and plain page loads; GPS ingest
+    # is machine traffic and must not keep BLE awake or lift the idle suspend.
+    if not path.startswith("/static/") and not is_ingest:
         _last_web_activity = time.time()
         if _ble_idle_suspend:
             _ble_idle_suspend = False
             logger.info("BLE idle sleep: web request on %s — auto-reconnect re-enabled", path)
+
+    if is_ingest and _gps_token is not None:
+        if _gps_token_valid(request.headers.get(_GPS_TOKEN_HEADER)):
+            return await call_next(request)
+        if _auth_hash is None:
+            # A configured token is mandatory even when the web UI is open.
+            return JSONResponse({"detail": "Invalid GPS token"}, status_code=401)
 
     if _auth_hash is None:
         # Auth not configured — pass all requests through.
@@ -783,6 +733,7 @@ async def connect_mower(req: ConnectRequest):
                 "Connected: address=%s  channel_id=%d  pin=%s",
                 req.address, req.channel_id, "yes" if req.pin else "no",
             )
+            _log_event("connect", "manual")
             # Sync mower clock to local time immediately after pairing
             try:
                 await _mower.set_time()
@@ -820,6 +771,7 @@ async def disconnect_mower():
     await _mower.disconnect()
     _mower = None
     _connected = False
+    _log_event("disconnect", "user")
     # Disable auto-reconnect so we don't immediately re-connect after user disconnect
     _reconnect_enabled = False
     _save_reconnect_state()
@@ -855,7 +807,7 @@ async def connection_status():
     # Properly tear down the old client so bleak-retry-connector does not keep
     # the BLE link alive at the OS level while the app believes it's gone.
     if _connected and (_mower is None or not _mower.is_connected()):
-        await _cleanup_connection()
+        await _cleanup_connection("link lost")
     uptime_s = int((dt.datetime.now() - _server_start_time).total_seconds()) if _server_start_time else None
     return {
         "connected": _connected,
@@ -1300,7 +1252,7 @@ async def get_runtime_estimate(duration_hours: float = 3.0):
     )
 
     return _compute_runtime_estimate(
-        samples=_runtime_samples,
+        samples=store.recent_samples(_MAX_SAMPLES),
         stats=stats,
         current_battery=battery,
         current_activity=activity,
@@ -1312,9 +1264,7 @@ async def get_runtime_estimate(duration_hours: float = 3.0):
 @app.delete("/api/runtime_samples")
 async def clear_runtime_samples():
     """Clear all collected runtime samples, resetting the estimator history."""
-    global _runtime_samples
-    _runtime_samples = []
-    _save_runtime_samples()
+    await asyncio.to_thread(store.clear_samples)
     return {"status": "ok", "sample_count": 0}
 
 
@@ -1350,6 +1300,7 @@ async def command_mow(req: MowRequest):
         }
         logger.info("CMD mow: cleared inhibit, set synthetic active session for %.1f h", req.duration_hours)
     await _mower.mower_override(req.duration_hours)
+    _log_event("command", f"mow {req.duration_hours:.4g} h")
     msg = (
         f"Mowing for {req.duration_hours:.4g} h — executor will park when done and then resume planned sessions."
         if _smart else
@@ -1376,6 +1327,7 @@ async def command_pause():
         planner._user_inhibited = True
         logger.info("CMD pause: set user inhibit — executor will skip sessions until resumed")
     await _mower.mower_pause()
+    _log_event("command", "pause")
     msg = (
         "Paused — executor inhibited. Use Resume to let the planner take over again."
         if _smart else
@@ -1425,6 +1377,7 @@ async def command_resume():
                     remaining_sec, end_dt.strftime("%H:%M"),
                 )
                 await _mower.mower_override_seconds(remaining_sec)
+                _log_event("command", f"resume session ({remaining_sec // 60} min left)")
                 msg = (
                     f"Resumed active session — mowing until {end_dt.strftime('%H:%M')} "
                     f"({remaining_sec // 60} min remaining)."
@@ -1434,6 +1387,7 @@ async def command_resume():
             # Session window just expired — fall through to normal resume
 
     await _mower.mower_resume()
+    _log_event("command", "resume")
     msg = (
         "Resumed — mower will follow the planner's next scheduled session."
         if _smart else
@@ -1462,6 +1416,7 @@ async def command_park():
             _cancelled = planner._active_session
             planner._active_session = None  # executor won't act on this session any more
             await _mower.mower_park_home()
+            _log_event("command", "park (session cancelled)")
             _next = planner.get_next_planned_session()
             _when = (
                 _next["start_dt"].strftime("%a %-d %b at %H:%M")
@@ -1481,6 +1436,7 @@ async def command_park():
                     "message": "No active session — mower is already between sessions."}
     else:
         await _mower.mower_park()
+        _log_event("command", "park until next start")
         return {"status": "ok", "action": "park_until_next_start", "control_mode": "classic",
                 "message": "Parked — will resume at next firmware scheduled start."}
 
@@ -1503,6 +1459,7 @@ async def command_park_home():
         planner._active_session = None  # cancel any in-progress session tracking
         logger.info("CMD park_home: set user inhibit + cleared active session")
     await _mower.mower_park_home()
+    _log_event("command", "park until further notice")
     msg = (
         "Parked until further notice — executor inhibited. Use Resume to let the planner take over again."
         if _smart else
@@ -1542,6 +1499,7 @@ async def command_park_duration(req: ParkDurationRequest):
         logger.info("CMD park_duration: set user inhibit, will auto-clear in %.0f s", duration_sec)
 
     await _mower.mower_park_duration(req.duration_hours)
+    _log_event("command", f"park {req.duration_hours:.4g} h")
     msg = (
         f"Parked for {req.duration_hours:.4g} h — executor inhibited. "
         f"Planner will resume automatically after the park window expires."
@@ -1860,6 +1818,198 @@ async def geocode(city: str):
     return results
 
 
+# ─── GPS location / coverage API ─────────────────────────────────────────────
+_GPS_TRACK_MAX = 2000          # cap on points returned to the live map
+
+
+_GPS_MIN_TS = 1_577_836_800     # 2020-01-01; rejects a GNSS module that has no date yet
+_GPS_MAX_TS_AHEAD_S = 3600      # tolerated clock skew into the future
+_GPS_BATCH_MAX = 500
+
+
+class GpsUpdate(BaseModel):
+    lat: float = Field(ge=-90, le=90)
+    lon: float = Field(ge=-180, le=180)
+    accuracy_m: Optional[float] = Field(default=None, ge=0)
+    ts: Optional[int] = None   # epoch seconds; defaults to server time
+    mowing: Optional[bool] = None  # None = infer from the mower sample at ts
+
+    @field_validator("ts")
+    @classmethod
+    def _ts_plausible(cls, v: Optional[int]) -> Optional[int]:
+        if v is not None and not _GPS_MIN_TS <= v <= time.time() + _GPS_MAX_TS_AHEAD_S:
+            raise ValueError("ts is not a plausible epoch time")
+        return v
+
+
+class GpsBatch(BaseModel):
+    fixes: list[GpsUpdate] = Field(min_length=1, max_length=_GPS_BATCH_MAX)
+
+
+def _resolve_session(session: str) -> Optional[int]:
+    """
+    Map the ``session`` query parameter to a session id.
+
+    'all' → None (every session); 'live' → the open session, falling back to the
+    most recent one so the view stays useful between runs; otherwise a numeric id.
+    """
+    if session == "all":
+        return None
+    if session == "live":
+        return store.latest_session_id()
+    try:
+        return int(session)
+    except ValueError as exc:
+        raise HTTPException(422, "session must be 'live', 'all' or a session id") from exc
+
+
+@app.post("/api/gps/update")
+async def gps_update(pos: GpsUpdate):
+    """Accept a GPS fix from the on-mower controller."""
+    ts = pos.ts if pos.ts is not None else int(time.time())
+    session_id = await asyncio.to_thread(
+        store.record_fix, ts, pos.lat, pos.lon, pos.accuracy_m, pos.mowing,
+    )
+    return {
+        "status": "ok",
+        "session_id": session_id,
+        "track_length": await asyncio.to_thread(store.fix_count),
+    }
+
+
+@app.post("/api/gps/batch")
+async def gps_batch(batch: GpsBatch):
+    """Accept several buffered GPS fixes at once; each carries its own ``ts``."""
+    now = int(time.time())
+    rows = [
+        (f.ts if f.ts is not None else now, f.lat, f.lon, f.accuracy_m, f.mowing)
+        for f in batch.fixes
+    ]
+    accepted, session_id = await asyncio.to_thread(store.record_fixes, rows)
+    return {
+        "status": "ok",
+        "accepted": accepted,
+        "session_id": session_id,
+        "track_length": await asyncio.to_thread(store.fix_count),
+    }
+
+
+@app.get("/api/gps/track")
+async def gps_get_track(max_points: int = 500, session: str = "live"):
+    """
+    Return GPS fixes and the latest position.
+
+    Defaults to the live session so the map shows the current run.
+    """
+    session_id = await asyncio.to_thread(_resolve_session, session)
+    limit = min(max_points, _GPS_TRACK_MAX) if max_points > 0 else None
+    points = await asyncio.to_thread(
+        store.fixes, session_id, False, limit,
+    )
+    current = await asyncio.to_thread(store.latest_fix)
+    return {
+        "current": current,
+        "track": points,
+        "session_id": session_id,
+        "total_fixes": await asyncio.to_thread(store.fix_count, session_id),
+    }
+
+
+@app.get("/api/gps/coverage")
+async def gps_coverage(
+    session: str = "live",
+    cell_m: float = 1.0,
+    max_accuracy_m: Optional[float] = None,
+):
+    """
+    Return the lawn-coverage heat map grid for one session or all of them.
+
+    Each cell carries the accumulated dwell time in seconds plus a 0..1 weight
+    normalised against the busiest cell, ready for a heat-map layer.
+    """
+    if not 0.1 <= cell_m <= 20.0:
+        raise HTTPException(422, "cell_m must be between 0.1 and 20")
+    session_id = await asyncio.to_thread(_resolve_session, session)
+    grid = await asyncio.to_thread(
+        store.coverage_grid, session_id, cell_m, max_accuracy_m,
+    )
+    grid["session_id"] = session_id
+    return grid
+
+
+@app.delete("/api/gps/track")
+async def gps_clear_track(session: str = "all"):
+    """Clear stored GPS fixes for one session, or all of them."""
+    session_id = await asyncio.to_thread(_resolve_session, session)
+    await asyncio.to_thread(store.delete_fixes, session_id)
+    return {"status": "ok", "track_length": await asyncio.to_thread(store.fix_count)}
+
+
+# ─── Session history API ──────────────────────────────────────────────────────
+
+def _iso(ts: Optional[int]) -> Optional[str]:
+    return dt.datetime.fromtimestamp(ts).isoformat(timespec="seconds") if ts else None
+
+
+def _session_summary(r: dict) -> dict:
+    """Flatten a session row into the shape the history and map views expect."""
+    started, ended = r["started_ts"], r["ended_ts"]
+    return {
+        "id": r["id"],
+        "started": _iso(started),
+        "ended": _iso(ended),
+        "date": r["local_date"],
+        "elapsed_min": round(((ended or int(time.time())) - started) / 60),
+        "mow_min": round(r["mow_sec"] / 60),
+        "charge_min": round(r["charge_sec"] / 60),
+        "search_min": round(r["search_sec"] / 60),
+        "battery_start": r["battery_start"],
+        "battery_end": r["battery_end"],
+        "battery_min": r["battery_min"],
+        "covered_m2": r["covered_m2"],
+        "fix_count": r.get("fix_count", 0),
+        "end_reason": r["end_reason"],
+        "source": r["source"],
+        "active": ended is None,
+    }
+
+
+@app.get("/api/sessions")
+async def list_sessions(limit: int = 50, with_coverage: bool = False):
+    """
+    List recent mowing sessions, newest first.
+
+    ``with_coverage`` restricts the result to sessions that actually have GPS
+    fixes, which is what the map's session picker needs.
+    """
+    limit = max(1, min(limit, 500))
+    rows = await asyncio.to_thread(store.list_sessions, limit, with_coverage)
+    return {"sessions": [_session_summary(r) for r in rows]}
+
+
+@app.get("/api/sessions/{session_id}")
+async def get_session_detail(session_id: int):
+    """Full history for one session: rollups, plan, battery series and timeline."""
+    detail = await asyncio.to_thread(store.session_detail, session_id)
+    if detail is None:
+        raise HTTPException(404, f"No session with id {session_id}")
+    return {
+        "session": _session_summary(detail["session"]),
+        "plan": detail["plan"],
+        "samples": detail["samples"],
+        "events": detail["events"],
+    }
+
+
+@app.delete("/api/sessions/{session_id}")
+async def delete_session(session_id: int):
+    """Delete a mowing session together with its fixes and events."""
+    if await asyncio.to_thread(store.get_session, session_id) is None:
+        raise HTTPException(404, f"No session with id {session_id}")
+    await asyncio.to_thread(store.delete_session, session_id)
+    return {"status": "ok"}
+
+
 # ─── Weather Watchdog API ─────────────────────────────────────────────────────
 
 @app.get("/api/watchdog/status")
@@ -1949,7 +2099,7 @@ def _configure_app_logging(
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Automower BLE Web Interface")
+    parser = argparse.ArgumentParser(description="Sir Schnittalot Web Interface")
     parser.add_argument(
         "--host", default="127.0.0.1", help="Host to bind (default: 127.0.0.1)"
     )
@@ -1973,6 +2123,12 @@ if __name__ == "__main__":
         default=None,
         help="Secret for signing session cookies (or set SECRET_KEY env var). "
              "Defaults to a random value — sessions expire on restart.",
+    )
+    parser.add_argument(
+        "--gps-token",
+        default=None,
+        help="Shared secret the on-mower GPS controller sends in the X-GPS-Token "
+             "header (or set GPS_TOKEN env var). Lets it post fixes without a login.",
     )
     parser.add_argument(
         "--log-file",
@@ -2002,6 +2158,7 @@ if __name__ == "__main__":
         args.password or os.environ.get("AUTH_PASSWORD"),
         args.secret_key or os.environ.get("SECRET_KEY"),
     )
+    _init_gps_token(args.gps_token)
     if _auth_hash is None:
         logging.warning(
             "No --password set: web UI is unprotected. "
