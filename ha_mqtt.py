@@ -64,6 +64,8 @@ class Hooks:
     run_command: Callable[[str, dict], Awaitable[str]]
     set_planner_enabled: Callable[[bool], Awaitable[None]]
     set_watchdog_enabled: Callable[[bool], None]
+    set_winter_mode: Callable[[bool], Awaitable[None]]
+    snooze_winter: Callable[[], Awaitable[None]]
 
 
 def ha_activity(
@@ -206,6 +208,9 @@ class HaBridge:
             watchdog_status=_clip(snap.get("watchdog_status") or ""),
             smart_context=snap.get("smart_context"),
             next_start=snap.get("next_start"),
+            winter_mode_enabled=_onoff(snap.get("winter_mode")),
+            winter_advice=snap.get("winter_advice") or "none",
+            winter_reason=_clip(snap.get("winter_reason") or ""),
         )
 
     async def push_live(self, sample: Optional[dict]) -> None:
@@ -304,6 +309,12 @@ class HaBridge:
             elif name == "watchdog":
                 self._hooks.set_watchdog_enabled(payload.upper() == "ON")
                 await self.push_planner()
+            elif name == "winter_mode":
+                await self._hooks.set_winter_mode(payload.upper() == "ON")
+                await self.push_planner()
+            elif name == "winter_snooze":
+                await self._hooks.snooze_winter()
+                await self.push_planner()
             elif name in _COMMANDS:
                 await self._run_mower_command(name)
             else:
@@ -315,6 +326,10 @@ class HaBridge:
     async def _run_mower_command(self, name: str) -> None:
         cmd, takes_hours = _COMMANDS[name]
         args = {"duration_hours": self._state["mow_hours"]} if takes_hours else {}
+        if self._state.get("winter_mode_enabled") == "ON":
+            # The reconnect loop is paused, so waiting for BLE would only time out.
+            await self._set_last_command(f"{name}: winter mode is active")
+            return
         async with self._cmd_lock:
             if not await self._ensure_connected():
                 await self._set_last_command(f"{name}: mower not reachable")
@@ -399,6 +414,9 @@ class HaBridge:
             sensor("blade_wear_pct", "Blade wear", unit_of_measurement="%",
                    state_class="measurement"),
             sensor("watchdog_status", "Weather watchdog", entity_category="diagnostic"),
+            sensor("winter_advice", "Winter advice", device_class="enum",
+                   options=["none", "enter", "exit"]),
+            sensor("winter_reason", "Winter advice reason", entity_category="diagnostic"),
             sensor("last_command", "Last HA command", entity_category="diagnostic"),
             binary("charging", "Charging", device_class="battery_charging"),
             binary("ble_connected", "Bluetooth link", device_class="connectivity",
@@ -406,8 +424,10 @@ class HaBridge:
             binary("watchdog_parked", "Parked by weather watchdog"),
             switch("planner", "Smart planner"),
             switch("watchdog", "Weather watchdog enabled"),
+            switch("winter_mode", "Winter mode"),
             button("resume", "Resume"),
             button("park_home", "Park until further notice"),
+            button("winter_snooze", "Snooze winter advice"),
             comp("number", "mow_hours", "Mow duration", state_topic=self.state_topic,
                  value_template=tpl("mow_hours"), command_topic=f"{base}/cmd/mow_hours",
                  min=0.5, max=12, step=0.5, unit_of_measurement="h", mode="box"),

@@ -256,6 +256,31 @@ def main() -> None:
                     [f"{row3} > .col-md-5", f"{row3} > .col-md-7"])
         _union_shot(page, OUT / "planner-forecast.png",
                     [f"{row3} > .col-12:last-child"], max_h=620)
+
+        # Winter mode: the advice endpoint is mocked because the demo forecast is a summer one.
+        since = (TODAY - dt.timedelta(days=30)).isoformat()
+        advice = {
+            "winter_mode": False, "since": None, "advice": "enter",
+            "reason": ("The lawn has stopped growing (growth index 0.04) and 5 of the next 7 days "
+                       "bring frost or snow. Time to store the mower for winter."),
+            "snoozed_until": None, "metrics": {}, "checked_at": dt.datetime.now().isoformat(),
+            "error": None,
+        }
+        page.route("**/api/winter/advice", lambda r: r.fulfill(json=advice))
+        page.evaluate("refreshWinter()")
+        page.wait_for_selector("#winter-banner:not(.d-none)")
+        _union_shot(page, OUT / "winter-advice.png", ["nav", "#winter-banner", "#main-tabs"])
+
+        active = {**advice, "winter_mode": True, "since": since, "advice": None, "reason": ""}
+        page.route("**/api/winter/advice", lambda r: r.fulfill(json=active))
+        page.evaluate("refreshWinter()")
+        page.wait_for_selector("#winter-banner.d-none", state="attached")
+        page.wait_for_selector("#nav-winter-badge:not(.d-none)")
+        # A viewport shot (not full-page) so the fixed frost and snow overlays sit at the screen corners.
+        page.evaluate("document.querySelector('nav').scrollIntoView({behavior: 'instant'})")
+        page.wait_for_timeout(500)
+        page.screenshot(path=str(OUT / "winter-mode.png"))
+        print("wrote docs/images/winter-mode.png")
         browser.close()
 
     server.should_exit = True

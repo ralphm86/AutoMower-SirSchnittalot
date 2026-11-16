@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="logo.jpeg" alt="Sir Schnittalot – Ritter des Rasens" width="260">
+  <img src="logo.png" alt="Sir Schnittalot – Ritter des Rasens" width="260">
 </p>
 
 <h1 align="center">Sir Schnittalot</h1>
@@ -156,6 +156,23 @@ With the defaults the mower runs 3 h every 2 days at peak growth, about every 4 
 > **Hint — heat-stress protection:** with adaptive mode on, only the midday no-mow window of heat-stress protection still applies; its reduced hot-day interval is ignored. Hot weather is instead handled by the growth index, which falls above 24 °C (mean temperature) and is 0 at 35 °C. Because the model uses the daily *mean* while heat stress triggers on the daily *maximum*, a day with a 30 °C maximum but a 22 °C mean still counts as full growth. If a no-mow window leaves no usable time, the backlog carries over to the next day.
 
 The **Lawn Growth** panel (see the screenshot above) shows the last 7 days and the forecast — growth index, soil water, rain, mowed minutes — and the current backlog. In the demo data a dry spell drains the soil and the growth index fades towards zero; the rain in the forecast brings it back. The panel is filled on every planner run even when adaptive mode is off, so you can compare it with the real state of your lawn before enabling it. Irrigation is not modelled.
+
+### Winter mode
+
+If the mower spends the winter in the cellar, the app would otherwise keep planning, polling the weather and waiting for a Bluetooth connection that never comes. **Winter mode** pauses all of that, and the app tells you when to switch it on and off. It never changes the mower's own schedule.
+
+**Advice.** Every 3 hours the app evaluates the growth model against the forecast (daily minimum temperature and snowfall are fetched in the same Open-Meteo request). A banner at the top of the page and the *Winter* badge in the navbar show the result; you confirm or postpone with **Later** (7 days). Entering and leaving winter mode are never automatic.
+
+| Advice | Conditions (all must hold) |
+|---|---|
+| **Enter winter mode** | today is inside the season (default 1 Oct – 1 Mar); mean growth index of the last 7 and next 7 days below 0.1; at least 3 of the next 7 days with frost or snow; mowing still owed below 10 % of a session |
+| **End winter mode** | today is outside the season; mean growth index of the next 5 days above 0.3 and mean temperature above 8 °C; no frost in the next 5 days |
+
+The enter and exit thresholds differ on purpose so the advice cannot flip back and forth, and the season guard stops a mild spell in January from suggesting the end. The season dates are set in the Planner tab (*Winter Mode*; `winter_earliest_md`, `winter_exit_earliest_md`, both `MM-DD`). The banner also offers a short storage checklist (charge to about 50 %, clean, store dry and frost-free). The Planner tab has a button to start or end winter mode manually at any time.
+
+**While winter mode is on:** the page shows frosted corners and a light snowfall animation (switch the snow off under *Winter Mode* in the Planner tab; the choice is stored per browser and the animation is skipped when the OS asks for reduced motion). The planner and weather watchdog do nothing, planned sessions are cleared, auto-reconnect is paused and the status shows *Winter mode since …*. Mower commands from Home Assistant are rejected with a note in *Last HA command*. Ending winter mode restarts the planner if it was enabled and the reconnect loop resumes.
+
+**API:** `GET /api/winter/advice`, `POST /api/winter/start`, `POST /api/winter/end`, `POST /api/winter/snooze`.
 
 ### Planner executor, watchdog and mow history
 
@@ -361,7 +378,25 @@ The app can publish the mower to Home Assistant through MQTT discovery; it stays
 
 3. The device appears automatically under **Settings → Devices & services → MQTT**.
 
-**Entities:** a `lawn_mower` (start = mow for the *Mow duration* number, pause, dock = park / cancel session), battery, charging, activity, state, error, planner "Session" and "Next start" (smart mode only), running time, charging cycles, blade wear, Bluetooth link, weather-watchdog status, *Smart planner* and *Weather watchdog* switches, *Resume* and *Park until further notice* buttons, and a *Last HA command* diagnostic sensor.
+**Entities:** a `lawn_mower` (start = mow for the *Mow duration* number, pause, dock = park / cancel session), battery, charging, activity, state, error, planner "Session" and "Next start" (smart mode only), running time, charging cycles, blade wear, Bluetooth link, weather-watchdog status, *Smart planner* and *Weather watchdog* switches, a *Winter mode* switch, a *Winter advice* sensor (`none`, `enter` or `exit`) with its *Winter advice reason*, *Resume*, *Park until further notice* and *Snooze winter advice* buttons, and a *Last HA command* diagnostic sensor.
+
+**Winter mode in HA:** the *Winter mode* switch mirrors and controls the web app's winter mode. To get a phone notification when the app advises a change, trigger an automation on the *Winter advice* sensor:
+
+```yaml
+automation:
+  - alias: Mower winter advice
+    triggers:
+      - trigger: state
+        entity_id: sensor.automower_winter_advice
+        to: ["enter", "exit"]
+    actions:
+      - action: notify.mobile_app_phone
+        data:
+          title: "Mower: winter mode {{ trigger.to_state.state }}"
+          message: "{{ states('sensor.automower_winter_advice_reason') }}"
+```
+
+Adjust the entity ids to your device name; confirm by switching *Winter mode* on or off, or press *Snooze winter advice*.
 
 **Behaviour:**
 - State is pushed from the existing 60 s sampler; the bridge adds no BLE polling. Statistics refresh every 30 min and only while connected.

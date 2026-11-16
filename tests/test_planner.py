@@ -193,6 +193,27 @@ class TestParseForecast:
         assert periods[0]["rain_mm"] == 0.0
 
 
+# ─── Winter mode ──────────────────────────────────────────────────────────────
+class TestWinterMode:
+    async def test_run_once_is_paused_and_fetches_nothing(self, monkeypatch):
+        async def _boom(*_a, **_k):
+            raise AssertionError("no forecast fetch in winter mode")
+
+        monkeypatch.setattr(planner, "load_config", lambda: {"winter_mode": True})
+        monkeypatch.setattr(planner, "fetch_forecast", _boom)
+        agent = planner.PlannerAgent()
+        assert "Winter mode" in await agent.run_once()
+
+    def test_clear_sessions_drops_planned_and_active(self, monkeypatch):
+        monkeypatch.setattr(planner, "save_planned_sessions", lambda *_a, **_k: None, raising=False)
+        agent = planner.PlannerAgent()
+        agent._planned_sessions = [{"start_dt": dt.datetime.now(), "duration_sec": 60}]
+        agent._active_session = {"start_dt": dt.datetime.now(), "duration_sec": 60}
+        agent.clear_sessions()
+        assert agent._planned_sessions == []
+        assert agent._active_session is None
+
+
 # ─── Mow history round-trip ───────────────────────────────────────────────────
 class TestMowHistory:
     def test_record_and_read_today(self, tmp_history):

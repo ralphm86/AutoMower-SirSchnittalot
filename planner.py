@@ -95,6 +95,14 @@ DEFAULT_CONFIG: dict = {
     "adaptive_session_hours": 3.0,        # mowing hours per session at peak growth
     "adaptive_peak_interval_days": 2,     # days between sessions at peak growth
     "adaptive_soil_capacity_mm": 40.0,    # plant-available water the soil can hold
+    # Winter mode: the app pauses planning and reconnecting while the mower is stored.
+    # Advice to enter is only given from winter_earliest_md, to leave from winter_exit_earliest_md.
+    "winter_earliest_md": "10-01",
+    "winter_exit_earliest_md": "03-01",
+    # Winter state, changed only through the winter endpoints
+    "winter_mode": False,
+    "winter_since": None,
+    "winter_snooze_until": None,   # ISO date; advice stays hidden until then
     # Runtime state (persisted for display only)
     "last_plan_time": None,
     "last_plan_result": "Never run",
@@ -251,7 +259,8 @@ def _fetch_openmeteo_sync(lat: float, lon: float) -> dict:
         "longitude": lon,
         "hourly": "temperature_2m,precipitation,windspeed_10m,weathercode,dew_point_2m,relative_humidity_2m",
         "daily": ("sunrise,sunset,temperature_2m_max,wind_speed_10m_max,"
-                  "temperature_2m_mean,precipitation_sum,et0_fao_evapotranspiration"),
+                  "temperature_2m_mean,temperature_2m_min,precipitation_sum,"
+                  "snowfall_sum,et0_fao_evapotranspiration"),
         "wind_speed_unit": "ms",
         "timezone": "auto",
         "forecast_days": 7,
@@ -284,7 +293,9 @@ def parse_daily(data: dict) -> dict[str, dict]:
     temp_maxes = daily.get("temperature_2m_max", [])
     wind_maxes = daily.get("wind_speed_10m_max", [])
     temp_means = daily.get("temperature_2m_mean", [])
+    temp_mins  = daily.get("temperature_2m_min", [])
     precips    = daily.get("precipitation_sum", [])
+    snowfalls  = daily.get("snowfall_sum", [])
     et0s       = daily.get("et0_fao_evapotranspiration", [])
 
     def _val(arr: list, i: int) -> Optional[float]:
@@ -307,7 +318,9 @@ def parse_daily(data: dict) -> dict[str, dict]:
             "temp_max_c": float(temp_maxes[i]) if i < len(temp_maxes) and temp_maxes[i] is not None else None,
             "wind_max_ms": float(wind_maxes[i]) if i < len(wind_maxes) and wind_maxes[i] is not None else None,
             "temp_mean_c": _val(temp_means, i),
+            "temp_min_c":  _val(temp_mins, i),
             "precip_mm":   _val(precips, i),
+            "snow_cm":     _val(snowfalls, i),
             "et0_mm":      _val(et0s, i),
         }
     return result
@@ -1173,6 +1186,36 @@ def compute_growth_plan(config: dict, all_daily: dict[str, dict]) -> tuple[Optio
     return plan_input, summary
 
 
+async def fetch_winter_inputs(config: dict) -> dict:
+    """
+    Fetch the forecast and reduce it to what ``growth.winter_advice`` needs.
+
+    Independent of the planner (no windows needed, works while winter mode keeps
+    the planner stopped).  The advice itself is computed later so the current
+    winter mode and snooze are always applied.
+    """
+    data = await fetch_forecast(float(config["location_lat"]), float(config["location_lon"]))
+    daily = parse_daily(data)
+    by_date = growth_model.simulate_growth(
+        daily, float(config.get("adaptive_soil_capacity_mm", 40.0))
+    )
+    session_h = float(config.get("adaptive_session_hours", 3.0))
+    per_day, _trigger, cap = growth_model.demand_params(
+        session_h, int(config.get("adaptive_peak_interval_days", 2))
+    )
+    mowed = {d: float(v.get("mow_sec", 0)) for d, v in load_mow_history().items()}
+    backlog = growth_model.carried_backlog_sec(
+        by_date, mowed, dt.date.today().isoformat(), per_day, cap
+    )
+    return {
+        "growth": by_date,
+        "daily": daily,
+        "backlog_sec": backlog,
+        "session_sec": session_h * 3600.0,
+        "checked_at": dt.datetime.now().isoformat(timespec="seconds"),
+    }
+
+
 # ─── Background agent ─────────────────────────────────────────────────────────
 
 class PlannerAgent:
@@ -1316,6 +1359,14 @@ class PlannerAgent:
     def is_running(self) -> bool:
         return bool(self._bg_task and not self._bg_task.done())
 
+    def clear_sessions(self) -> None:
+        """Drop every planned and active session (used when winter mode starts)."""
+        self._planned_sessions = []
+        self._active_session = None
+        self._needs_connection = False
+        self.next_run_dt = None
+        save_planned_sessions([])
+
     def start(self) -> None:
         if not self.is_running():
             self._stop_event    = asyncio.Event()
@@ -1338,6 +1389,9 @@ class PlannerAgent:
     async def run_once(self) -> str:
         """Fetch weather, compute plan, push to mower. Returns status string."""
         config = load_config()
+
+        if config.get("winter_mode"):
+            return self._set_result("Winter mode — planning paused")
 
         if not config.get("available_windows"):
             return self._set_result("No available time windows configured")
@@ -1757,7 +1811,7 @@ class PlannerAgent:
 
         while self._stop_event and not self._stop_event.is_set():
             config = load_config()
-            if config.get("enabled"):
+            if config.get("enabled") and not config.get("winter_mode"):
                 try:
                     await self.run_once()
                 except Exception as e:
@@ -2034,7 +2088,7 @@ class WeatherWatchdog:
         """Background loop: check current weather at the configured interval."""
         while self._stop_event and not self._stop_event.is_set():
             config = load_config()
-            if config.get("watchdog_enabled"):
+            if config.get("watchdog_enabled") and not config.get("winter_mode"):
                 try:
                     await self.check_once()
                 except Exception as e:

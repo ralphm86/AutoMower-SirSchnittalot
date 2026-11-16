@@ -72,6 +72,107 @@ class TestParseDaily:
         assert day["precip_mm"] == 2.0
         assert day["et0_mm"] is None
 
+    def test_winter_inputs_parsed(self):
+        data = {
+            "daily": {
+                "time": ["2026-01-10", "2026-01-11"],
+                "temperature_2m_mean": [-1.0, 2.0],
+                "temperature_2m_min": [-4.5, None],
+                "snowfall_sum": [1.2, 0.0],
+            },
+            "utc_offset_seconds": 0,
+        }
+        days = parse_daily(data)
+        assert days["2026-01-10"]["temp_min_c"] == -4.5
+        assert days["2026-01-10"]["snow_cm"] == 1.2
+        assert days["2026-01-11"]["temp_min_c"] is None
+
+
+def _winter_case(today, past_t, future_t, future_min=None, snow=0.0):
+    """Daily weather 7 days back and 7 ahead with constant temperatures."""
+    day0 = dt.date.fromisoformat(today)
+    daily = {}
+    for i in range(-7, 7):
+        t = past_t if i < 0 else future_t
+        daily[(day0 + dt.timedelta(days=i)).isoformat()] = {
+            "temp_mean_c": t,
+            "temp_min_c": t - 3.0 if future_min is None or i < 0 else future_min,
+            "snow_cm": snow if i >= 0 else 0.0,
+            "precip_mm": 0.0,
+            "et0_mm": 0.5,
+        }
+    return daily, growth.simulate_growth(daily)
+
+
+class TestWinterAdvice:
+    SESSION = 3 * 3600
+
+    def _advice(self, today, winter, daily, g, backlog=0.0, **kw):
+        return growth.winter_advice(g, daily, today, winter, backlog, self.SESSION, **kw)
+
+    def test_enter_when_dormant_and_frost_ahead(self):
+        daily, g = _winter_case("2026-11-15", past_t=2.0, future_t=0.0)
+        out = self._advice("2026-11-15", False, daily, g)
+        assert out["action"] == "enter"
+        assert out["metrics"]["frost_days"] == 7
+        assert out["reason"]
+
+    def test_no_enter_while_lawn_still_grows(self):
+        daily, g = _winter_case("2026-11-15", past_t=16.0, future_t=16.0, future_min=2.0)
+        assert self._advice("2026-11-15", False, daily, g)["action"] is None
+
+    def test_no_enter_without_frost_ahead(self):
+        daily, g = _winter_case("2026-11-15", past_t=2.0, future_t=3.0, future_min=1.0)
+        assert self._advice("2026-11-15", False, daily, g)["action"] is None
+
+    def test_snow_counts_as_frost(self):
+        daily, g = _winter_case("2026-11-15", past_t=2.0, future_t=3.0, future_min=1.0, snow=2.0)
+        assert self._advice("2026-11-15", False, daily, g)["action"] == "enter"
+
+    def test_no_enter_with_large_backlog(self):
+        daily, g = _winter_case("2026-11-15", past_t=2.0, future_t=0.0)
+        out = self._advice("2026-11-15", False, daily, g, backlog=self.SESSION)
+        assert out["action"] is None
+
+    def test_no_enter_outside_season(self):
+        daily, g = _winter_case("2026-06-15", past_t=2.0, future_t=0.0)
+        assert self._advice("2026-06-15", False, daily, g)["action"] is None
+
+    def test_season_wraps_over_new_year(self):
+        daily, g = _winter_case("2027-01-20", past_t=2.0, future_t=0.0)
+        assert self._advice("2027-01-20", False, daily, g)["action"] == "enter"
+
+    def test_exit_when_spring_has_come(self):
+        daily, g = _winter_case("2026-04-10", past_t=12.0, future_t=14.0, future_min=6.0)
+        out = self._advice("2026-04-10", True, daily, g, backlog=2 * 3600)
+        assert out["action"] == "exit"
+        assert "2.0 h" in out["reason"]
+
+    def test_no_exit_while_still_in_winter_season(self):
+        daily, g = _winter_case("2027-01-20", past_t=12.0, future_t=14.0, future_min=6.0)
+        assert self._advice("2027-01-20", True, daily, g)["action"] is None
+
+    def test_no_exit_when_frost_returns(self):
+        daily, g = _winter_case("2026-04-10", past_t=12.0, future_t=14.0, future_min=-1.0)
+        assert self._advice("2026-04-10", True, daily, g)["action"] is None
+
+    def test_no_exit_when_still_cold(self):
+        daily, g = _winter_case("2026-04-10", past_t=6.0, future_t=7.0, future_min=3.0)
+        assert self._advice("2026-04-10", True, daily, g)["action"] is None
+
+    def test_conditions_for_entering_never_end_winter_mode(self):
+        daily, g = _winter_case("2026-11-15", past_t=2.0, future_t=0.0)
+        assert self._advice("2026-11-15", True, daily, g)["action"] is None
+
+    def test_missing_forecast_gives_no_advice(self):
+        assert self._advice("2026-11-15", False, {}, {})["action"] is None
+        assert self._advice("2026-04-10", True, {}, {})["action"] is None
+
+    def test_custom_season_dates(self):
+        daily, g = _winter_case("2026-11-15", past_t=2.0, future_t=0.0)
+        out = self._advice("2026-11-15", False, daily, g, enter_md="12-01", exit_md="02-01")
+        assert out["action"] is None
+
 
 def _growth_input(g, carry_h=0.0, session_h=3.0, interval=2):
     per_day, trigger, cap = growth.demand_params(session_h, interval)

@@ -497,3 +497,135 @@ class TestPagesRender:
         r = c.get("/login")
         assert r.status_code == 200
         assert "Sign in to continue" in r.text
+
+
+# ─── Winter mode ──────────────────────────────────────────────────────────────
+def _md(offset_days):
+    import datetime as dt
+
+    return (dt.date.today() + dt.timedelta(days=offset_days)).strftime("%m-%d")
+
+
+# A season that contains today / does not contain today.
+IN_SEASON = {"winter_earliest_md": _md(-1), "winter_exit_earliest_md": _md(2)}
+OFF_SEASON = {"winter_earliest_md": _md(1), "winter_exit_earliest_md": _md(2)}
+
+
+@pytest.fixture
+def winter(web, monkeypatch):
+    """In-memory planner config and a fake forecast; nothing touches the disk or network."""
+    import datetime as dt
+
+    from tests.test_growth import _winter_case
+
+    store = {"enabled": False, "watchdog_enabled": False, **IN_SEASON}
+    monkeypatch.setattr(web, "planner_load_config", lambda: dict(store))
+    monkeypatch.setattr(web, "planner_save_config", lambda cfg: store.update(cfg))
+    monkeypatch.setattr(web, "_winter_inputs", None)
+    monkeypatch.setattr(web, "_winter_error", None)
+
+    class Env:
+        cfg = store
+        calls = 0
+
+        def forecast(self, past_t, future_t, future_min=None, backlog_sec=0.0):
+            today = dt.date.today().isoformat()
+            daily, g = _winter_case(today, past_t, future_t, future_min)
+
+            async def fetch(_cfg):
+                self.calls += 1
+                return {
+                    "growth": g,
+                    "daily": daily,
+                    "backlog_sec": backlog_sec,
+                    "session_sec": 3 * 3600,
+                    "checked_at": "now",
+                }
+
+            monkeypatch.setattr(web, "fetch_winter_inputs", fetch)
+
+    return Env()
+
+
+class TestWinterMode:
+    def test_no_advice_in_mild_weather(self, winter, client):
+        winter.forecast(past_t=16.0, future_t=16.0, future_min=5.0)
+        body = client.get("/api/winter/advice").json()
+        assert body["winter_mode"] is False
+        assert body["advice"] is None
+
+    def test_advises_entering_when_lawn_is_dormant(self, winter, client):
+        winter.forecast(past_t=2.0, future_t=0.0)
+        body = client.get("/api/winter/advice").json()
+        assert body["advice"] == "enter"
+        assert body["reason"]
+        assert body["metrics"]["frost_days"] >= 3
+
+    def test_forecast_failure_is_reported_not_raised(self, winter, client, web, monkeypatch):
+        async def fail(_cfg):
+            raise RuntimeError("offline")
+
+        monkeypatch.setattr(web, "fetch_winter_inputs", fail)
+        body = client.get("/api/winter/advice").json()
+        assert body["advice"] is None
+        assert body["error"] == "offline"
+
+    def test_start_sets_flags_and_clears_sessions(self, winter, client, web):
+        winter.forecast(past_t=2.0, future_t=0.0)
+        web.planner._planned_sessions = [{"start_dt": None, "duration_sec": 60}]
+        body = client.post("/api/winter/start").json()
+        assert body["winter_mode"] is True
+        assert body["since"]
+        assert winter.cfg["winter_mode"] is True
+        assert web.planner._planned_sessions == []
+        # Already in winter mode: the entering advice no longer applies.
+        assert body["advice"] is None
+
+    def test_end_clears_flags(self, winter, client):
+        winter.forecast(past_t=12.0, future_t=14.0, future_min=6.0)
+        winter.cfg.update(winter_mode=True, winter_since="2026-11-15", **OFF_SEASON)
+        body = client.post("/api/winter/end").json()
+        assert body["winter_mode"] is False
+        assert body["since"] is None
+        assert winter.cfg["winter_mode"] is False
+
+    def test_advises_ending_in_spring(self, winter, client):
+        winter.forecast(past_t=12.0, future_t=14.0, future_min=6.0, backlog_sec=7200)
+        winter.cfg.update(winter_mode=True, winter_since="2026-11-15", **OFF_SEASON)
+        body = client.get("/api/winter/advice").json()
+        assert body["advice"] == "exit"
+        assert "2.0 h" in body["reason"]
+
+    def test_snooze_hides_advice(self, winter, client):
+        winter.forecast(past_t=2.0, future_t=0.0)
+        assert client.get("/api/winter/advice").json()["advice"] == "enter"
+        body = client.post("/api/winter/snooze").json()
+        assert body["advice"] is None
+        assert body["snoozed_until"] == winter.cfg["winter_snooze_until"]
+
+    def test_starting_clears_a_snooze(self, winter, client):
+        winter.forecast(past_t=2.0, future_t=0.0)
+        client.post("/api/winter/snooze")
+        client.post("/api/winter/start")
+        assert winter.cfg["winter_snooze_until"] is None
+
+    def test_status_shows_winter_context(self, winter, connected_client):
+        winter.cfg.update(winter_mode=True, winter_since="2026-11-15")
+        body = connected_client.get("/api/status").json()
+        assert body["smart_context"] == "Winter mode since 2026-11-15"
+
+    def test_config_save_preserves_winter_state(self, winter, client):
+        winter.cfg.update(winter_mode=True, winter_since="2026-11-15", winter_snooze_until=None)
+        r = client.post(
+            "/api/planner/config",
+            json={"enabled": False, "winter_earliest_md": "11-01", "winter_exit_earliest_md": "04-01"},
+        )
+        assert r.status_code == 200
+        assert winter.cfg["winter_mode"] is True
+        assert winter.cfg["winter_since"] == "2026-11-15"
+        assert winter.cfg["winter_earliest_md"] == "11-01"
+
+    @pytest.mark.parametrize("bad", ["13-01", "1-1", "10/01", "10-32"])
+    def test_config_rejects_invalid_season_dates(self, winter, client, bad):
+        r = client.post("/api/planner/config", json={"winter_earliest_md": bad})
+        assert r.status_code == 422

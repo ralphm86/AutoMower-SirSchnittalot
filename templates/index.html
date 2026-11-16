@@ -30,25 +30,67 @@
       content: '';
       position: fixed;
       inset: 0;
-      background: url('/static/logo.jpeg') center center / 55vh auto no-repeat;
+      background: url('/static/logo.png') center center / 55vh auto no-repeat;
       opacity: 0.4;
       pointer-events: none;
       z-index: 0;
     }
     body > * { position: relative; z-index: 1; }
+    #frost {
+      display: none; position: fixed; inset: 0; pointer-events: none; z-index: 6999;
+      background:
+        radial-gradient(ellipse 16% 24% at 0 0, rgba(255,255,255,.9), rgba(220,238,252,.5) 50%, transparent),
+        radial-gradient(ellipse 16% 24% at 100% 0, rgba(255,255,255,.9), rgba(220,238,252,.5) 50%, transparent),
+        radial-gradient(ellipse 16% 24% at 0 100%, rgba(255,255,255,.9), rgba(220,238,252,.5) 50%, transparent),
+        radial-gradient(ellipse 16% 24% at 100% 100%, rgba(255,255,255,.9), rgba(220,238,252,.5) 50%, transparent);
+      box-shadow: inset 0 0 40px 2px rgba(235,246,255,.45);
+      /* Noise mask makes the frost patchy like ice crystals instead of a smooth vignette. */
+      -webkit-mask-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='320' height='320'><filter id='n'><feTurbulence type='fractalNoise' baseFrequency='0.03 0.045' numOctaves='5' seed='7'/><feColorMatrix values='0 0 0 0 1 0 0 0 0 1 0 0 0 0 1 0 0 0 -2.4 1.7'/></filter><rect width='100%25' height='100%25' filter='url(%23n)'/></svg>");
+      mask-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='320' height='320'><filter id='n'><feTurbulence type='fractalNoise' baseFrequency='0.03 0.045' numOctaves='5' seed='7'/><feColorMatrix values='0 0 0 0 1 0 0 0 0 1 0 0 0 0 1 0 0 0 -2.4 1.7'/></filter><rect width='100%25' height='100%25' filter='url(%23n)'/></svg>");
+    }
+    body.winter-mode #frost { display: block; }
+    #snowfall { display: none; position: fixed; inset: 0; overflow: hidden; pointer-events: none; z-index: 7000; }
+    body.winter-snow #snowfall { display: block; }
+    .snowflake {
+      position: absolute; top: 0; border-radius: 50%; background: #fff;
+      box-shadow: 0 0 2px rgba(40,80,130,.6);
+      animation: snowfall linear infinite;
+    }
+    @keyframes snowfall {
+      from { transform: translate3d(0, -5vh, 0); }
+      to   { transform: translate3d(var(--drift), 105vh, 0); }
+    }
+    @media (prefers-reduced-motion: reduce) { #snowfall { display: none !important; } }
+
+    /* Winter theme: cold sky, steel-blue top bar fading softly into the page. */
+    body.winter-mode { background: linear-gradient(180deg, #5f86a6 0%, #9cbdd4 60%, #cfe2ee 100%) fixed; }
+    body.winter-mode::before { opacity: .3; }
+    body.winter-mode nav.navbar { background: linear-gradient(180deg, #4d7ea6, #3a6a90) !important; }
+    body.winter-mode nav.navbar::after {
+      content: ''; position: absolute; left: 0; right: 0; top: 100%; height: 28px; pointer-events: none;
+      background: linear-gradient(180deg, rgba(58,106,144,.55), rgba(58,106,144,.2) 45%, transparent);
+    }
+    body.winter-mode .nav-tabs { border-bottom-color: rgba(255,255,255,.7); }
+    body.winter-mode .nav-tabs .nav-link:not(.active) { color: #14293d; }
+    body.winter-mode .section > .text-muted,
+    body.winter-mode .section > div:not(.card):not(.row) .text-muted { color: #26384a !important; }
   </style>
 </head>
 <body>
+
+<div id="frost" aria-hidden="true"></div>
+<div id="snowfall" aria-hidden="true"></div>
 
 <!-- Navbar -->
 <nav class="navbar navbar-dark bg-success mb-4">
   <div class="container-fluid">
     <span class="navbar-brand d-flex align-items-center gap-2">
-      <img src="/static/logo.jpeg" alt="Sir Schnittalot" height="42" class="rounded-circle border border-2 border-white">
+      <img src="/static/logo.png" alt="Sir Schnittalot" height="42">
       Sir Schnittalot
     </span>
     <div class="d-flex align-items-center gap-2">
       <span id="nav-uptime" class="text-white-50 small d-none" title="Server uptime"><i class="bi bi-clock me-1"></i><span id="nav-uptime-val"></span></span>
+      <span id="nav-winter-badge" class="badge bg-info text-dark fs-6 d-none" title="Winter mode: planner, watchdog and auto-reconnect are paused"><i class="bi bi-snow me-1"></i>Winter</span>
       <span id="nav-conn-badge" class="badge bg-danger fs-6">Disconnected</span>
       <form method="post" action="/logout" class="m-0">
         <button type="submit" class="btn btn-outline-light btn-sm" title="Sign out">
@@ -61,6 +103,26 @@
 
 <!-- Tabs -->
 <div class="container-xl">
+  <!-- Winter mode advice: filled by refreshWinter() -->
+  <div id="winter-banner" class="alert alert-info mb-3 d-none" role="alert">
+    <div class="d-flex flex-wrap align-items-start gap-3">
+      <i class="bi bi-snow fs-3"></i>
+      <div class="flex-grow-1">
+        <div id="winter-banner-title" class="fw-semibold"></div>
+        <div id="winter-banner-reason"></div>
+        <ul id="winter-banner-checklist" class="small mb-0 mt-2">
+          <li>Charge the battery to about 50&nbsp;% and switch the mower off.</li>
+          <li>Clean the mower, blades and charging contacts.</li>
+          <li>Store it dry and frost-free, for example in the cellar.</li>
+        </ul>
+      </div>
+      <div class="d-flex gap-2">
+        <button id="winter-banner-accept" class="btn btn-info btn-sm" onclick="acceptWinterAdvice()"></button>
+        <button class="btn btn-outline-secondary btn-sm" onclick="snoozeWinterAdvice()">Later</button>
+      </div>
+    </div>
+  </div>
+
   <ul class="nav nav-tabs mb-4" id="main-tabs">
     <li class="nav-item"><a class="nav-link active" data-section="sec-connect"><i class="bi bi-bluetooth me-1"></i>Connect</a></li>
     <li class="nav-item"><a class="nav-link" data-section="sec-status"><i class="bi bi-speedometer2 me-1"></i>Status</a></li>
@@ -428,6 +490,33 @@
                 </div>
               </div>
               <div class="text-muted small mt-1">Planner runs at whichever comes first: the interval <em>or</em> the fixed daily time.</div>
+            </div>
+
+            <div class="mb-3">
+              <label class="form-label fw-semibold"><i class="bi bi-snow me-1"></i>Winter Mode</label>
+              <div class="row g-2">
+                <div class="col">
+                  <div class="input-group input-group-sm">
+                    <span class="input-group-text">Suggest from</span>
+                    <input id="pl-winter-from" type="text" class="form-control" value="10-01" pattern="\d\d-\d\d" placeholder="MM-DD" />
+                  </div>
+                </div>
+                <div class="col">
+                  <div class="input-group input-group-sm">
+                    <span class="input-group-text">End from</span>
+                    <input id="pl-winter-to" type="text" class="form-control" value="03-01" pattern="\d\d-\d\d" placeholder="MM-DD" />
+                  </div>
+                </div>
+              </div>
+              <div class="text-muted small mt-1">Winter advice is only given inside this date range (MM-DD). While winter mode is on, planner, watchdog and auto-reconnect are paused; the mower's own schedule is not touched.</div>
+              <div class="d-flex align-items-center gap-2 mt-2">
+                <span id="pl-winter-state" class="small text-muted"></span>
+                <button id="pl-winter-toggle" type="button" class="btn btn-outline-info btn-sm ms-auto" onclick="toggleWinterMode()">Start winter mode</button>
+              </div>
+              <div class="form-check form-switch mt-2">
+                <input id="pl-snowfall" type="checkbox" class="form-check-input" role="switch" checked onchange="setSnowfall(this.checked)" />
+                <label class="form-check-label small" for="pl-snowfall">Snowfall animation while winter mode is on (this browser only)</label>
+              </div>
             </div>
 
           </div>
@@ -1118,6 +1207,105 @@ async function toggleAutoReconnect(enabled) {
 }
 setInterval(refreshConnBadge, 15000);
 refreshConnBadge();
+
+// ─── Winter mode ──────────────────────────────────────────────────────────────
+let _winter = null;
+
+function _snowEnabled() {
+  try { return localStorage.getItem('snowfall') !== 'off'; } catch { return true; }
+}
+
+function _buildSnow() {
+  const box = document.getElementById('snowfall');
+  if (box.childElementCount) return;
+  for (let i = 0; i < 70; i++) {
+    const f = document.createElement('span');
+    const size = 4 + Math.random() * 6;
+    f.className = 'snowflake';
+    f.style.cssText =
+      `left:${Math.random() * 100}%;width:${size}px;height:${size}px;` +
+      `opacity:${0.7 + Math.random() * 0.3};` +
+      `animation-duration:${8 + Math.random() * 10}s;animation-delay:${-Math.random() * 18}s;` +
+      `--drift:${(Math.random() - 0.5) * 12}vw`;
+    box.appendChild(f);
+  }
+}
+
+function applySnow() {
+  const on = !!(_winter && _winter.winter_mode) && _snowEnabled();
+  if (on) _buildSnow();
+  document.body.classList.toggle('winter-snow', on);
+  const box = document.getElementById('pl-snowfall');
+  if (box) box.checked = _snowEnabled();
+}
+
+function setSnowfall(enabled) {
+  try { localStorage.setItem('snowfall', enabled ? 'on' : 'off'); } catch {}
+  applySnow();
+}
+
+function renderWinter(w) {
+  _winter = w;
+  document.body.classList.toggle('winter-mode', !!w.winter_mode);
+  applySnow();
+  document.getElementById('nav-winter-badge').classList.toggle('d-none', !w.winter_mode);
+
+  const banner = document.getElementById('winter-banner');
+  if (w.advice) {
+    const entering = w.advice === 'enter';
+    document.getElementById('winter-banner-title').textContent =
+      entering ? 'Time for winter mode?' : 'Time to end winter mode?';
+    document.getElementById('winter-banner-reason').textContent = w.reason;
+    document.getElementById('winter-banner-checklist').classList.toggle('d-none', !entering);
+    document.getElementById('winter-banner-accept').textContent =
+      entering ? 'Start winter mode' : 'End winter mode';
+    banner.classList.remove('d-none');
+  } else {
+    banner.classList.add('d-none');
+  }
+
+  const state = document.getElementById('pl-winter-state');
+  const btn = document.getElementById('pl-winter-toggle');
+  if (state && btn) {
+    state.textContent = w.winter_mode
+      ? 'Winter mode is on' + (w.since ? ' since ' + w.since : '')
+      : 'Winter mode is off';
+    btn.textContent = w.winter_mode ? 'End winter mode' : 'Start winter mode';
+  }
+}
+
+async function refreshWinter() {
+  try { renderWinter(await api('GET', '/api/winter/advice')); } catch {}
+}
+
+async function _winterAction(path, okMsg) {
+  try {
+    renderWinter(await api('POST', path));
+    toast(okMsg);
+    refreshConnBadge();
+  } catch (e) {
+    toast('Error: ' + e.message, 'danger');
+  }
+}
+
+function acceptWinterAdvice() {
+  if (!_winter) return;
+  if (_winter.advice === 'enter') _winterAction('/api/winter/start', 'Winter mode started');
+  else _winterAction('/api/winter/end', 'Winter mode ended');
+}
+
+function snoozeWinterAdvice() {
+  _winterAction('/api/winter/snooze', 'Reminder postponed by a week');
+}
+
+function toggleWinterMode() {
+  if (!_winter) return;
+  if (_winter.winter_mode) _winterAction('/api/winter/end', 'Winter mode ended');
+  else _winterAction('/api/winter/start', 'Winter mode started');
+}
+
+setInterval(refreshWinter, 3600000);
+refreshWinter();
 
 // ─── Scan ─────────────────────────────────────────────────────────────────────
 async function scanDevices() {
@@ -1901,6 +2089,8 @@ async function loadPlannerConfig() {
     document.getElementById('pl-watchdog').checked = !!cfg.watchdog_enabled;
     document.getElementById('pl-watchdog-interval').value = cfg.watchdog_interval_minutes ?? 5;
     document.getElementById('pl-watchdog-dry-delay').value = cfg.watchdog_dry_delay_minutes ?? 0;
+    document.getElementById('pl-winter-from').value = cfg.winter_earliest_md || '10-01';
+    document.getElementById('pl-winter-to').value = cfg.winter_exit_earliest_md || '03-01';
 
     // Populate windows table
     const tbody = document.getElementById('windows-body');
@@ -2036,6 +2226,8 @@ async function savePlannerConfig() {
     watchdog_enabled: document.getElementById('pl-watchdog').checked,
     watchdog_interval_minutes: parseInt(document.getElementById('pl-watchdog-interval').value) || 5,
     watchdog_dry_delay_minutes: parseInt(document.getElementById('pl-watchdog-dry-delay').value) || 0,
+    winter_earliest_md: document.getElementById('pl-winter-from').value.trim() || '10-01',
+    winter_exit_earliest_md: document.getElementById('pl-winter-to').value.trim() || '03-01',
     available_windows: windows,
   };
 
@@ -2046,6 +2238,7 @@ async function savePlannerConfig() {
     hideSpinner();
     el.innerHTML = `<div class="alert alert-success">Configuration saved. Planner: ${data.enabled ? '✅ enabled' : '⏸ disabled'}.</div>`;
     toast('Planner config saved');
+    refreshWinter();
   } catch (e) {
     hideSpinner();
     el.innerHTML = `<div class="alert alert-danger">Save failed: ${escHtml(e.message)}</div>`;

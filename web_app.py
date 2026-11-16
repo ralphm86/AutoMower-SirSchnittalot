@@ -49,9 +49,11 @@ from planner import (
     save_config as planner_save_config,
     DEFAULT_CONFIG as PLANNER_DEFAULT_CONFIG,
     geocode_city,
+    fetch_winter_inputs,
     get_mow_sec_today,
     load_mow_history,
 )
+import growth as growth_model
 import store
 
 logger = logging.getLogger("web_app")
@@ -418,6 +420,10 @@ async def _reconnect_loop() -> None:
             if _ble_idle_suspend:
                 continue
 
+            # The mower is stored away in winter mode; scanning for it is pointless.
+            if planner_load_config().get("winter_mode"):
+                continue
+
             # Skip if /api/connect is already running a connect attempt.
             if _connection_lock.locked():
                 continue
@@ -562,7 +568,7 @@ watchdog.set_planner_provider(lambda: planner)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _reconnect_task, _sampler_task, _startup_connect_done, _idle_disconnect_task, _last_web_activity, _server_start_time
+    global _reconnect_task, _sampler_task, _startup_connect_done, _idle_disconnect_task, _last_web_activity, _server_start_time, _winter_task
     _server_start_time = dt.datetime.now()
     # Re-apply our logging config: uvicorn calls configure_logging() internally
     # during startup which resets the handlers we set before uvicorn.run().
@@ -583,6 +589,7 @@ async def lifespan(app: FastAPI):
     _reconnect_task = asyncio.create_task(_reconnect_loop())
     _sampler_task = asyncio.create_task(_sampler_loop())
     _idle_disconnect_task = asyncio.create_task(_idle_disconnect_loop())
+    _winter_task = asyncio.create_task(_winter_advice_loop())
     cfg = planner_load_config()
     logger.info(
         "═══ Sir Schnittalot starting ═══  "
@@ -594,7 +601,7 @@ async def lifespan(app: FastAPI):
         _reconnect_cfg.get("address") if _reconnect_cfg else "none",
         len(store.recent_samples(_MAX_SAMPLES)),
     )
-    if cfg.get("enabled"):
+    if cfg.get("enabled") and not cfg.get("winter_mode"):
         planner.set_startup_event(_startup_connect_done)
         planner.start()
     watchdog.start()  # always running; gated internally by watchdog_enabled flag
@@ -604,7 +611,7 @@ async def lifespan(app: FastAPI):
     logger.info("Sir Schnittalot shutdown")
     if _ha_bridge is not None:
         await _ha_bridge.stop()
-    for t in (_reconnect_task, _sampler_task, _idle_disconnect_task):
+    for t in (_reconnect_task, _sampler_task, _idle_disconnect_task, _winter_task):
         if t:
             t.cancel()
     await planner.stop()
@@ -1013,6 +1020,8 @@ async def get_status():
 
         smart_context = _smart_context_text(active_end_dt, activity, remaining_charging_min)
 
+    smart_context = _winter_context_text(_planner_cfg) or smart_context
+
     return {
         "connected": True,
         "address": _mower.address,
@@ -1028,6 +1037,7 @@ async def get_status():
         "mode": mode_name,
         "control_mode": control_mode,
         "smart_context": smart_context,
+        "winter_mode": bool(_planner_cfg.get("winter_mode")),
         "user_inhibited": planner._user_inhibited if _planner_active else False,
         "restriction_reason": restriction_reason,
         "battery_level": battery,
@@ -1727,6 +1737,9 @@ class WindowModel(BaseModel):
     end_hour: int      # 1–24
 
 
+_MONTH_DAY_PATTERN = r"^(0[1-9]|1[0-2])-(0[1-9]|[12][0-9]|3[01])$"
+
+
 class PlannerConfigRequest(BaseModel):
     enabled: bool = False
     location_lat: float = 52.52
@@ -1759,6 +1772,8 @@ class PlannerConfigRequest(BaseModel):
     adaptive_session_hours: float = 3.0
     adaptive_peak_interval_days: int = 2
     adaptive_soil_capacity_mm: float = 40.0
+    winter_earliest_md: str = Field("10-01", pattern=_MONTH_DAY_PATTERN)
+    winter_exit_earliest_md: str = Field("03-01", pattern=_MONTH_DAY_PATTERN)
 
 
 @app.get("/api/planner/config")
@@ -1781,6 +1796,9 @@ async def set_planner_config(req: PlannerConfigRequest):
     # Preserve persisted runtime state
     cfg["last_plan_time"] = existing.get("last_plan_time")
     cfg["last_plan_result"] = existing.get("last_plan_result")
+    # Winter state is owned by the /api/winter endpoints, not by this form.
+    for key in ("winter_mode", "winter_since", "winter_snooze_until"):
+        cfg[key] = existing.get(key, PLANNER_DEFAULT_CONFIG[key])
     planner_save_config(cfg)
 
     await _apply_planner_enabled(cfg["enabled"])
@@ -2097,6 +2115,125 @@ async def watchdog_check_now():
     return {"status": "ok", "result": result}
 
 
+# ─── Winter mode ──────────────────────────────────────────────────────────────
+_WINTER_REFRESH_S = 3 * 3600
+_WINTER_RETRY_S = 900
+_WINTER_SNOOZE_DAYS = 7
+
+# Forecast-derived inputs for growth.winter_advice; the advice itself is computed per
+# request so the current winter mode and snooze always apply.
+_winter_inputs: Optional[dict] = None
+_winter_error: Optional[str] = None
+_winter_task: Optional[asyncio.Task] = None
+
+
+async def _refresh_winter_inputs() -> None:
+    global _winter_inputs, _winter_error
+    try:
+        _winter_inputs = await fetch_winter_inputs({**PLANNER_DEFAULT_CONFIG, **planner_load_config()})
+        _winter_error = None
+    except Exception as exc:
+        _winter_error = str(exc)
+        logger.warning("Winter advice: forecast unavailable: %s", exc)
+
+
+async def _winter_advice_loop() -> None:
+    """Keep the advice fresh without a browser open, so Home Assistant sees it too."""
+    while True:
+        await _refresh_winter_inputs()
+        if _ha_bridge is not None:
+            await _ha_bridge.push_planner()
+        await asyncio.sleep(_WINTER_RETRY_S if _winter_error else _WINTER_REFRESH_S)
+
+
+def _winter_view() -> dict:
+    cfg = {**PLANNER_DEFAULT_CONFIG, **planner_load_config()}
+    winter = bool(cfg["winter_mode"])
+    today_iso = dt.date.today().isoformat()
+    advice: dict = {"action": None, "reason": "", "metrics": {}}
+    if _winter_inputs:
+        advice = growth_model.winter_advice(
+            _winter_inputs["growth"], _winter_inputs["daily"], today_iso, winter,
+            _winter_inputs["backlog_sec"], _winter_inputs["session_sec"],
+            cfg["winter_earliest_md"], cfg["winter_exit_earliest_md"],
+        )
+    snooze = cfg.get("winter_snooze_until")
+    snoozed = bool(snooze and snooze > today_iso)
+    suggested = None if snoozed else advice["action"]
+    return {
+        "winter_mode": winter,
+        "since": cfg.get("winter_since"),
+        "advice": suggested,
+        "reason": advice["reason"] if suggested else "",
+        "snoozed_until": snooze if snoozed else None,
+        "metrics": advice["metrics"],
+        "checked_at": _winter_inputs["checked_at"] if _winter_inputs else None,
+        "error": _winter_error,
+    }
+
+
+def _winter_context_text(cfg: dict) -> Optional[str]:
+    if not cfg.get("winter_mode"):
+        return None
+    since = cfg.get("winter_since")
+    return f"Winter mode since {since}" if since else "Winter mode"
+
+
+async def _apply_winter_mode(active: bool) -> None:
+    """Start or end winter mode: the app stops planning and reconnecting while it is on."""
+    cfg = planner_load_config()
+    if bool(cfg.get("winter_mode")) == active:
+        return
+    cfg["winter_mode"] = active
+    cfg["winter_since"] = dt.date.today().isoformat() if active else None
+    cfg["winter_snooze_until"] = None
+    planner_save_config(cfg)
+    if active:
+        await planner.stop()
+        planner.clear_sessions()
+    else:
+        await _apply_planner_enabled(bool(cfg.get("enabled")))
+    logger.info("Winter mode %s", "started" if active else "ended")
+    if _ha_bridge is not None:
+        await _ha_bridge.push_planner()
+
+
+async def _snooze_winter() -> None:
+    cfg = planner_load_config()
+    cfg["winter_snooze_until"] = (
+        dt.date.today() + dt.timedelta(days=_WINTER_SNOOZE_DAYS)
+    ).isoformat()
+    planner_save_config(cfg)
+    if _ha_bridge is not None:
+        await _ha_bridge.push_planner()
+
+
+@app.get("/api/winter/advice")
+async def get_winter_advice():
+    """Winter mode state plus a suggestion to enter or leave it (null when none applies)."""
+    if _winter_inputs is None:
+        await _refresh_winter_inputs()
+    return _winter_view()
+
+
+@app.post("/api/winter/start")
+async def start_winter_mode():
+    await _apply_winter_mode(True)
+    return _winter_view()
+
+
+@app.post("/api/winter/end")
+async def end_winter_mode():
+    await _apply_winter_mode(False)
+    return _winter_view()
+
+
+@app.post("/api/winter/snooze")
+async def snooze_winter_advice():
+    await _snooze_winter()
+    return _winter_view()
+
+
 # ─── Home Assistant bridge wiring ─────────────────────────────────────────────
 def _ha_wake() -> None:
     global _ble_idle_suspend
@@ -2154,13 +2291,17 @@ def _ha_planner_snapshot() -> dict:
         nxt = planner.get_next_planned_session()
         if nxt and not planner._active_session:
             next_start = nxt["start_dt"].astimezone().isoformat()
+    winter = _winter_view()
     return {
         "planner_enabled": enabled,
         "watchdog_enabled": bool(cfg.get("watchdog_enabled")),
         "watchdog_parked": watchdog._parked_by_watchdog,
         "watchdog_status": watchdog.last_status,
-        "smart_context": smart_context,
-        "next_start": next_start,
+        "smart_context": _winter_context_text(cfg) or smart_context,
+        "next_start": None if winter["winter_mode"] else next_start,
+        "winter_mode": winter["winter_mode"],
+        "winter_advice": winter["advice"] or "none",
+        "winter_reason": winter["reason"],
     }
 
 
@@ -2209,6 +2350,8 @@ def _start_ha_bridge() -> None:
         run_command=_ha_run_command,
         set_planner_enabled=_ha_set_planner_enabled,
         set_watchdog_enabled=_ha_set_watchdog_enabled,
+        set_winter_mode=_apply_winter_mode,
+        snooze_winter=_snooze_winter,
     )
     _ha_bridge = ha_mqtt.HaBridge(ha_mqtt.MqttConfig(**_mqtt_cfg), hooks)
     _ha_bridge.start()

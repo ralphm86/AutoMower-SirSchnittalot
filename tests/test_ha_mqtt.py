@@ -30,6 +30,9 @@ class FakeHooks:
         self.fail_with = None
         self.planner_calls = []
         self.watchdog_calls = []
+        self.winter_calls = []
+        self.snoozes = 0
+        self.snapshot_extra = {}
 
     def hooks(self):
         async def read_identity():
@@ -50,6 +53,12 @@ class FakeHooks:
         async def set_planner(enabled):
             self.planner_calls.append(enabled)
 
+        async def set_winter(enabled):
+            self.winter_calls.append(enabled)
+
+        async def snooze():
+            self.snoozes += 1
+
         def wake():
             self.woken = True
 
@@ -67,10 +76,13 @@ class FakeHooks:
                 "watchdog_status": "ok",
                 "smart_context": "Next: Mon",
                 "next_start": None,
+                **self.snapshot_extra,
             },
             run_command=run_command,
             set_planner_enabled=set_planner,
             set_watchdog_enabled=self.watchdog_calls.append,
+            set_winter_mode=set_winter,
+            snooze_winter=snooze,
         )
 
 
@@ -197,6 +209,49 @@ class TestCommands:
     async def test_long_status_text_is_clipped(self, bridge):
         await bridge._set_last_command("x" * 400)
         assert len(bridge._state["last_command"]) <= 255
+
+
+class TestWinterMode:
+    def test_discovery_has_winter_entities(self, bridge):
+        comps = bridge.discovery_payload()["components"]
+        assert comps["winter_mode"]["platform"] == "switch"
+        assert comps["winter_snooze"]["platform"] == "button"
+        assert comps["winter_advice"]["device_class"] == "enum"
+        assert comps["winter_advice"]["options"] == ["none", "enter", "exit"]
+        assert "winter_reason" in comps
+
+    async def test_state_defaults_when_snapshot_lacks_winter_keys(self, bridge):
+        await bridge.push_planner()
+        state = bridge._client.last_state()
+        assert state["winter_mode_enabled"] == "OFF"
+        assert state["winter_advice"] == "none"
+
+    async def test_state_reflects_snapshot(self, bridge, fake):
+        fake.snapshot_extra = {
+            "winter_mode": False,
+            "winter_advice": "enter",
+            "winter_reason": "Growth has stopped",
+        }
+        await bridge.push_planner()
+        state = bridge._client.last_state()
+        assert state["winter_advice"] == "enter"
+        assert state["winter_reason"] == "Growth has stopped"
+
+    async def test_switch_commands(self, bridge, fake):
+        await bridge._handle(f"{bridge.base}/cmd/winter_mode", "ON")
+        await bridge._handle(f"{bridge.base}/cmd/winter_mode", "OFF")
+        assert fake.winter_calls == [True, False]
+
+    async def test_snooze_button(self, bridge, fake):
+        await bridge._handle(f"{bridge.base}/cmd/winter_snooze", "PRESS")
+        assert fake.snoozes == 1
+
+    async def test_mower_commands_are_rejected_in_winter_mode(self, bridge, fake):
+        bridge._state["winter_mode_enabled"] = "ON"
+        await bridge._handle(f"{bridge.base}/cmd/pause", "PRESS")
+        assert fake.commands == []
+        assert fake.woken is False
+        assert "winter" in bridge._state["last_command"]
 
 
 class TestWebAppWiring:

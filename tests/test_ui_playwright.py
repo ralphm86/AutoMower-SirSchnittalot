@@ -159,6 +159,89 @@ class TestCommandsTab:
         page.wait_for_selector("text=Mow", timeout=5000)
 
 
+WINTER_ENTER = {
+    "winter_mode": False,
+    "since": None,
+    "advice": "enter",
+    "reason": "The lawn has stopped growing.",
+    "snoozed_until": None,
+    "metrics": {},
+    "checked_at": "now",
+    "error": None,
+}
+
+
+class TestWinterBanner:
+    def test_enter_advice_shows_banner(self, page, live_server):
+        _json_route(page, "**/api/connection", {"connected": False, "address": None})
+        _json_route(page, "**/api/winter/advice", WINTER_ENTER)
+        page.goto(live_server)
+        page.wait_for_selector("#winter-banner:not(.d-none)")
+        assert "stopped growing" in page.locator("#winter-banner-reason").inner_text()
+        assert page.locator("#winter-banner-accept").inner_text() == "Start winter mode"
+        assert page.locator("#nav-winter-badge").is_hidden()
+
+    def test_exit_advice_in_winter_mode(self, page, live_server):
+        _json_route(page, "**/api/connection", {"connected": False, "address": None})
+        _json_route(
+            page,
+            "**/api/winter/advice",
+            {**WINTER_ENTER, "winter_mode": True, "since": "2026-11-15", "advice": "exit"},
+        )
+        page.goto(live_server)
+        page.wait_for_selector("#winter-banner:not(.d-none)")
+        assert page.locator("#winter-banner-accept").inner_text() == "End winter mode"
+        assert page.locator("#nav-winter-badge").is_visible()
+
+    def test_no_advice_hides_banner(self, page, live_server):
+        _json_route(page, "**/api/connection", {"connected": False, "address": None})
+        _json_route(page, "**/api/winter/advice", {**WINTER_ENTER, "advice": None})
+        page.goto(live_server)
+        page.wait_for_selector("#nav-conn-badge")
+        assert page.locator("#winter-banner").is_hidden()
+
+
+class TestSnowfall:
+    ACTIVE = {**WINTER_ENTER, "winter_mode": True, "since": "2026-11-15", "advice": None}
+
+    def _open(self, page, live_server, payload):
+        _json_route(page, "**/api/connection", {"connected": False, "address": None})
+        _json_route(page, "**/api/winter/advice", payload)
+        page.goto(live_server)
+        page.wait_for_selector("#nav-conn-badge")
+
+    def test_snow_falls_in_winter_mode(self, page, live_server):
+        self._open(page, live_server, self.ACTIVE)
+        page.wait_for_selector("body.winter-snow")
+        assert page.locator("#snowfall").is_visible()
+        assert page.locator("#snowfall .snowflake").count() > 0
+
+    def test_no_snow_outside_winter_mode(self, page, live_server):
+        self._open(page, live_server, {**self.ACTIVE, "winter_mode": False})
+        page.wait_for_selector("#nav-conn-badge")
+        assert page.locator("#snowfall").is_hidden()
+        assert page.locator("#frost").is_hidden()
+
+    def test_frost_corners_show_in_winter_mode_even_without_snow(self, page, live_server):
+        self._open(page, live_server, self.ACTIVE)
+        page.wait_for_selector("body.winter-mode")
+        assert page.locator("#frost").is_visible()
+        page.click("a[data-section='sec-planner']")
+        page.uncheck("#pl-snowfall")
+        assert page.locator("#snowfall").is_hidden()
+        assert page.locator("#frost").is_visible()
+
+    def test_toggle_turns_snow_off_and_is_remembered(self, page, live_server):
+        self._open(page, live_server, self.ACTIVE)
+        page.wait_for_selector("body.winter-snow")
+        page.click("a[data-section='sec-planner']")
+        page.uncheck("#pl-snowfall")
+        assert page.locator("#snowfall").is_hidden()
+        page.reload()
+        page.wait_for_selector("#nav-winter-badge:not(.d-none)")
+        assert page.locator("#snowfall").is_hidden()
+
+
 class TestNavigation:
     def test_tab_switching_changes_active_section(self, page, live_server):
         _json_route(page, "**/api/connection", {"connected": False, "address": None})
