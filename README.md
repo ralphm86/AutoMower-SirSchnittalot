@@ -333,6 +333,14 @@ python web_app.py [options]
 | `--log-file` | _(none)_ | Also write logs to this rotating file |
 | `--log-max-mb` | `10` | Max size (MB) before the log file rotates |
 | `--log-backups` | `5` | Number of rotated log files to keep |
+| `--demo` | off | Simulate a mower (or `DEMO_MODE=1`); see below |
+| `--demo-speed` | `10` | Demo: battery drain/charging runs this many times faster than real time (or `DEMO_SPEED`) |
+
+### Demo mode
+
+`python web_app.py --demo` runs the full UI against a simulated Automower 450X, for presentations without a mower or Bluetooth adapter. The mower is already connected on start-up and responds like the real one: forced mowing, pause, park, weekly schedule edits, battery drain and recharge cycles, statistics, messages, and a GPS track for the live map. Planner, watchdog and the weekly-schedule start also act on it.
+
+Everything is stored in a temporary directory that is deleted on exit, so the real database and settings are never read or changed. Battery and charging are fast-forwarded (`--demo-speed`) so a full mow/charge cycle fits into a talk; positions, overrides and schedules run in real time. A `DEMO` badge is shown in the header. The simulated mower follows a Mon–Fri 09:00 and Sat 10:00 schedule, so start it manually with **Mow** if you demo outside those hours. The planner's weather forecast still needs internet access.
 
 ---
 

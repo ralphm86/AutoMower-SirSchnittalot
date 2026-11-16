@@ -91,6 +91,7 @@
     <div class="d-flex align-items-center gap-2">
       <span id="nav-uptime" class="text-white-50 small d-none" title="Server uptime"><i class="bi bi-clock me-1"></i><span id="nav-uptime-val"></span></span>
       <span id="nav-winter-badge" class="badge bg-info text-dark fs-6 d-none" title="Winter mode: planner, watchdog and auto-reconnect are paused"><i class="bi bi-snow me-1"></i>Winter</span>
+      <span id="nav-demo-badge" class="badge bg-warning text-dark fs-6 d-none" title="Simulated mower — no Bluetooth hardware in use"><i class="bi bi-controller me-1"></i>DEMO</span>
       <span id="nav-conn-badge" class="badge bg-danger fs-6">Disconnected</span>
       <form method="post" action="/logout" class="m-0">
         <button type="submit" class="btn btn-outline-light btn-sm" title="Sign out">
@@ -1150,6 +1151,7 @@ async function refreshConnBadge() {
   try {
     const data = await api('GET', '/api/connection');
     _isConnected = !!data.connected;
+    document.getElementById('nav-demo-badge').classList.toggle('d-none', !data.demo);
     const badge = document.getElementById('nav-conn-badge');
     if (data.connected) {
       badge.className = 'badge bg-success fs-6';

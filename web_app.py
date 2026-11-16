@@ -15,6 +15,7 @@ import json
 import logging
 import os
 import secrets
+import tempfile
 import datetime as dt
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -33,6 +34,7 @@ import subprocess
 from bleak import BleakScanner
 
 from automower_ble.mower import Mower
+from automower_ble.demo import DEMO_ADDRESS, DemoMower
 from automower_ble.protocol import (
     MowerState,
     MowerActivity,
@@ -42,6 +44,7 @@ from automower_ble.protocol import (
 )
 from automower_ble.error_codes import ErrorCodes
 from automower_ble.models import MowerModels
+import planner as planner_module
 from planner import (
     PlannerAgent,
     WeatherWatchdog,
@@ -204,9 +207,85 @@ _idle_disconnect_task: Optional[asyncio.Task] = None
 _BLE_IDLE_TIMEOUT_S: int = 300    # seconds of web inactivity before disconnect
 _BLE_IDLE_CHECK_S: int = 60       # how often the idle checker polls
 
+# ─── Demo mode ────────────────────────────────────────────────────────────────
+# A simulated mower plus a throw-away data directory, so the app can be shown
+# without Bluetooth hardware and without touching real history or settings.
+_demo: bool = False
+_demo_speed: float = 10.0
+_demo_dir: Optional[tempfile.TemporaryDirectory] = None
+_demo_mower: Optional[DemoMower] = None
+_demo_gps_task: Optional[asyncio.Task] = None
+_DEMO_GPS_DOCKED_EVERY = 30       # one fix per N seconds while parked in the station
+_DEMO_HISTORY_HOURS = (2.5, 2.0, 3.0, 2.25, 2.75, 2.5, 3.0)  # one mow every 2nd day
+
+
+def _init_demo(enabled: bool, speed: float = 10.0) -> None:
+    global _demo, _demo_speed, _demo_dir, _SAMPLE_INTERVAL_S
+    if not enabled:
+        return
+    _demo, _demo_speed = True, speed
+    _SAMPLE_INTERVAL_S = 15   # fast-forwarded battery needs denser samples for charts
+    if _demo_dir is None:
+        _demo_dir = tempfile.TemporaryDirectory(prefix="automower-demo-")
+        base = Path(_demo_dir.name)
+        planner_module.CONFIG_PATH = base / "planner_config.json"
+        planner_module.PLANNED_SESSIONS_PATH = base / "planned_sessions.json"
+        planner_module.PLAN_LOG_PATH = base / "plan_log.json"
+
+
+def _seed_demo_history() -> None:
+    today = dt.date.today()
+    for n, hours in enumerate(_DEMO_HISTORY_HOURS):
+        store.record_mowing_day(today - dt.timedelta(days=13 - 2 * n), int(hours * 3600))
+
+
+async def _start_demo_mower() -> None:
+    global _mower, _connected, _demo_mower
+    cfg = planner_load_config()
+    _demo_mower = DemoMower(
+        speed=_demo_speed,
+        origin=(cfg["location_lat"], cfg["location_lon"]),
+    )
+    await _demo_mower.connect(None)
+    _mower, _connected = _demo_mower, True
+    await asyncio.to_thread(_seed_demo_history)
+    _log_event("connect", "demo")
+
+
+async def _demo_gps_loop() -> None:
+    """Keep the simulation running and feed its position in like a GPS tracker would."""
+    parked_ticks = 0
+    while True:
+        await asyncio.sleep(1.0)
+        m = _demo_mower
+        if m is None:
+            continue
+        m.advance()
+        if m.docked:
+            parked_ticks += 1
+            if parked_ticks % _DEMO_GPS_DOCKED_EVERY != 1:
+                continue
+        else:
+            parked_ticks = 0
+        fix = m.gps_fix()
+        try:
+            await asyncio.to_thread(
+                store.record_fix, int(time.time()), fix["lat"], fix["lon"], fix["accuracy_m"],
+            )
+        except Exception as exc:
+            logger.debug("Demo GPS fix failed (ignored): %s", exc)
+
+
+_init_demo(
+    os.environ.get("DEMO_MODE", "").lower() in ("1", "true", "yes", "on"),
+    float(os.environ.get("DEMO_SPEED") or 10.0),
+)
+
 
 def _load_reconnect_state() -> None:
     global _reconnect_cfg, _reconnect_enabled
+    if _demo:
+        return
     if _RECONNECT_CONFIG_PATH.exists():
         try:
             data = json.loads(_RECONNECT_CONFIG_PATH.read_text())
@@ -217,6 +296,8 @@ def _load_reconnect_state() -> None:
 
 
 def _save_reconnect_state() -> None:
+    if _demo:
+        return
     _RECONNECT_CONFIG_PATH.write_text(json.dumps(
         {"target": _reconnect_cfg, "enabled": _reconnect_enabled}, indent=2
     ))
@@ -370,14 +451,15 @@ async def _cleanup_connection(reason: str = "") -> None:
             await m.disconnect()
         except Exception as exc:
             logger.warning("Mower disconnect error (ignored): %s", exc)
-        try:
-            result = subprocess.run(
-                ["bluetoothctl", "disconnect", m.address],
-                capture_output=True, text=True, timeout=5, check=False,
-            )
-            logger.debug("bluetoothctl disconnect: %s", result.stdout.strip() or result.stderr.strip())
-        except Exception as exc:
-            logger.debug("bluetoothctl cleanup failed: %s", exc)
+        if not _demo:
+            try:
+                result = subprocess.run(
+                    ["bluetoothctl", "disconnect", m.address],
+                    capture_output=True, text=True, timeout=5, check=False,
+                )
+                logger.debug("bluetoothctl disconnect: %s", result.stdout.strip() or result.stderr.strip())
+            except Exception as exc:
+                logger.debug("bluetoothctl cleanup failed: %s", exc)
         logger.info("Cleanup: mower %s disconnected", m.address)
         _log_event("disconnect", reason)
 
@@ -568,7 +650,7 @@ watchdog.set_planner_provider(lambda: planner)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _reconnect_task, _sampler_task, _startup_connect_done, _idle_disconnect_task, _last_web_activity, _server_start_time, _winter_task
+    global _reconnect_task, _sampler_task, _startup_connect_done, _idle_disconnect_task, _last_web_activity, _server_start_time, _winter_task, _demo_gps_task, _demo_dir
     _server_start_time = dt.datetime.now()
     # Re-apply our logging config: uvicorn calls configure_logging() internally
     # during startup which resets the handlers we set before uvicorn.run().
@@ -576,19 +658,31 @@ async def lifespan(app: FastAPI):
     _configure_app_logging(_log_level_str, _log_file, _log_max_mb, _log_backups)
     # Startup
     _load_reconnect_state()
-    store.init_db()
+    if _demo:
+        _init_demo(True, _demo_speed)  # recreates the data dir after a previous shutdown
+        store.init_db(Path(_demo_dir.name) / "demo.db", import_legacy=False)
+    else:
+        store.init_db()
     store.close_stale_sessions()
     store.prune()
     _last_web_activity = time.time()  # treat server start as recent activity
     # Startup connect event: signals the planner when the first reconnect
     # attempt is done so it doesn't try to push before the mower is reachable.
     _startup_connect_done = asyncio.Event()
-    if not _reconnect_enabled or not _reconnect_cfg:
+    if _demo or not _reconnect_enabled or not _reconnect_cfg:
         # No reconnect configured — planner may proceed immediately.
         _startup_connect_done.set()
-    _reconnect_task = asyncio.create_task(_reconnect_loop())
+    if _demo:
+        logger.warning(
+            "DEMO MODE: simulated mower (battery/charging %.4gx real time), "
+            "temporary data, no Bluetooth", _demo_speed,
+        )
+        await _start_demo_mower()
+        _demo_gps_task = asyncio.create_task(_demo_gps_loop())
+    else:
+        _reconnect_task = asyncio.create_task(_reconnect_loop())
+        _idle_disconnect_task = asyncio.create_task(_idle_disconnect_loop())
     _sampler_task = asyncio.create_task(_sampler_loop())
-    _idle_disconnect_task = asyncio.create_task(_idle_disconnect_loop())
     _winter_task = asyncio.create_task(_winter_advice_loop())
     cfg = planner_load_config()
     logger.info(
@@ -611,12 +705,15 @@ async def lifespan(app: FastAPI):
     logger.info("Sir Schnittalot shutdown")
     if _ha_bridge is not None:
         await _ha_bridge.stop()
-    for t in (_reconnect_task, _sampler_task, _idle_disconnect_task, _winter_task):
+    for t in (_reconnect_task, _sampler_task, _idle_disconnect_task, _winter_task, _demo_gps_task):
         if t:
             t.cancel()
     await planner.stop()
     await watchdog.stop()
     store.close_db()
+    if _demo_dir is not None:
+        _demo_dir.cleanup()
+        _demo_dir = None
 
 
 app = FastAPI(title="Sir Schnittalot", lifespan=lifespan)
@@ -752,6 +849,13 @@ async def logout():
 @app.get("/api/scan")
 async def scan_devices(timeout: float = 10.0):
     """Scan for nearby BLE devices. Husqvarna devices are flagged."""
+    if _demo:
+        return [{
+            "address": DEMO_ADDRESS,
+            "name": "Automower (demo)",
+            "rssi": -52,
+            "husqvarna": True,
+        }]
     devices = await BleakScanner.discover(timeout=timeout, return_adv=True)
     results = []
     for d, a in devices.values():
@@ -777,8 +881,8 @@ async def connect_mower(req: ConnectRequest):
     if _connected and _mower:
         raise HTTPException(400, "Already connected — disconnect first.")
 
-    device = await BleakScanner.find_device_by_address(req.address)
-    if device is None:
+    device = None if _demo else await BleakScanner.find_device_by_address(req.address)
+    if device is None and not _demo:
         raise HTTPException(404, f"BLE device not found: {req.address}")
 
     async with _connection_lock:
@@ -786,7 +890,8 @@ async def connect_mower(req: ConnectRequest):
         if _connected and _mower:
             raise HTTPException(400, "Already connected — disconnect first.")
 
-        candidate = Mower(req.channel_id, req.address, req.pin)
+        # The demo mower keeps "driving" while disconnected, like a real one.
+        candidate = _demo_mower if _demo else Mower(req.channel_id, req.address, req.pin)
         result = await candidate.connect(device)
 
         if result == ResponseResult.OK:
@@ -881,6 +986,7 @@ async def connection_status():
         "saved_pin": _reconnect_cfg.get("pin") if _reconnect_cfg else None,
         "server_started_at": _server_start_time.isoformat(timespec="seconds") if _server_start_time else None,
         "uptime_seconds": uptime_s,
+        "demo": _demo,
     }
 
 
@@ -2473,6 +2579,21 @@ if __name__ == "__main__":
                         help="Home Assistant discovery prefix (or MQTT_DISCOVERY_PREFIX; "
                              "default 'homeassistant').")
     parser.add_argument(
+        "--demo",
+        action="store_true",
+        help="Demo mode (or DEMO_MODE=1): simulate a mower instead of using "
+             "Bluetooth. Uses a temporary database and settings, so real data "
+             "is never touched.",
+    )
+    parser.add_argument(
+        "--demo-speed",
+        type=float,
+        default=None,
+        metavar="X",
+        help="Demo mode: run battery drain/charging X times faster than real "
+             "time (default: 10; also DEMO_SPEED).",
+    )
+    parser.add_argument(
         "--log-file",
         default=None,
         metavar="PATH",
@@ -2501,6 +2622,9 @@ if __name__ == "__main__":
         args.secret_key or os.environ.get("SECRET_KEY"),
     )
     _init_gps_token(args.gps_token)
+    if args.demo_speed is not None and args.demo_speed <= 0:
+        parser.error("--demo-speed must be > 0")
+    _init_demo(args.demo or _demo, args.demo_speed or _demo_speed)
     _init_mqtt(
         args.mqtt_host, args.mqtt_port, args.mqtt_user, args.mqtt_password,
         args.mqtt_prefix, args.mqtt_discovery_prefix,
