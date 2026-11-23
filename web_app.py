@@ -176,6 +176,8 @@ _mower: Optional[Mower] = None
 _connected: bool = False
 _connection_lock = asyncio.Lock()   # serialises connect / disconnect operations
 _server_start_time: Optional[dt.datetime] = None
+_status_snapshot: Optional[dict] = None
+_status_snapshot_at: Optional[dt.datetime] = None
 
 # ─── Auto-reconnect ───────────────────────────────────────────────────────────
 _RECONNECT_CONFIG_PATH = Path("reconnect_config.json")
@@ -789,6 +791,34 @@ class ParkDurationRequest(BaseModel):
     duration_hours: float = 1.0
 
 
+_MANUAL_DURATION_MIN_MINUTES = 15
+_MANUAL_DURATION_MAX_MINUTES = 720
+_MANUAL_DURATION_MIN_HOURS = _MANUAL_DURATION_MIN_MINUTES / 60
+_MANUAL_DURATION_MAX_HOURS = _MANUAL_DURATION_MAX_MINUTES / 60
+_SUPPORTED_COMMANDS = ("mow", "pause", "resume", "park", "park_home", "park_duration")
+
+
+def _validate_manual_duration(duration_hours: float) -> None:
+    if not _MANUAL_DURATION_MIN_HOURS <= duration_hours <= _MANUAL_DURATION_MAX_HOURS:
+        raise HTTPException(
+            422,
+            detail={
+                "field": "duration_hours",
+                "min": _MANUAL_DURATION_MIN_HOURS,
+                "max": _MANUAL_DURATION_MAX_HOURS,
+            },
+        )
+
+
+@app.get("/api/capabilities")
+async def get_capabilities():
+    return {
+        "commands": list(_SUPPORTED_COMMANDS),
+        "min_manual_duration_min": _MANUAL_DURATION_MIN_MINUTES,
+        "max_manual_duration_min": _MANUAL_DURATION_MAX_MINUTES,
+    }
+
+
 # ─── HTML page ────────────────────────────────────────────────────────────────
 @app.get("/", response_class=HTMLResponse)
 async def index(request: Request):
@@ -991,6 +1021,108 @@ async def connection_status():
 
 
 # ─── Status ───────────────────────────────────────────────────────────────────
+def _status_activity(
+    activity: Optional[MowerActivity],
+    state: Optional[MowerState],
+    error_code: Optional[int],
+) -> str:
+    """Map BLE state/activity into the stable public C-01 vocabulary."""
+    if error_code not in (None, 0) or state in (MowerState.FATAL_ERROR, MowerState.ERROR):
+        return "error"
+    if state == MowerState.PAUSED:
+        return "paused"
+    if activity in (MowerActivity.MOWING, MowerActivity.GOING_OUT):
+        return "mowing"
+    if activity == MowerActivity.CHARGING:
+        return "charging"
+    if activity == MowerActivity.GOING_HOME:
+        return "returning"
+    if activity == MowerActivity.PARKED:
+        return "parked"
+    if activity == MowerActivity.STOPPED_IN_GARDEN:
+        return "paused"
+    return "unknown"
+
+
+def _planner_public_state(config: dict) -> str:
+    cfg = {**PLANNER_DEFAULT_CONFIG, **config}
+    if cfg.get("winter_mode"):
+        return "winter"
+    if not cfg.get("enabled"):
+        return "idle"
+    if getattr(planner, "_planning", False):
+        return "running"
+
+    result = str(planner.last_result or cfg.get("last_plan_result") or "Never run")
+    lowered = result.lower()
+    if "never run" in lowered:
+        return "idle"
+    if "no available time windows" in lowered or not cfg.get("available_windows"):
+        return "invalid_setup"
+    if "failed" in lowered or lowered.startswith("error:"):
+        return "failed"
+    if "planned 0 session" in lowered or "no upcoming sessions" in lowered:
+        return "zero_sessions"
+    return "ok"
+
+
+def _planner_public_inhibit(config: dict) -> Optional[str]:
+    cfg = {**PLANNER_DEFAULT_CONFIG, **config}
+    if cfg.get("winter_mode"):
+        return "winter"
+    if planner._user_inhibited:
+        reason = getattr(planner, "_user_inhibit_reason", None)
+        if reason in {"paused_by_user", "parked_until_resumed", "parked_until"}:
+            until = getattr(planner, "_user_inhibit_until", None)
+            if reason != "parked_until" or (until and until > dt.datetime.now()):
+                return reason
+        return "paused_by_user"
+    if watchdog._parked_by_watchdog:
+        return "weather_hold"
+    return None
+
+
+def _daily_target_status(config: dict) -> dict:
+    cfg = {**PLANNER_DEFAULT_CONFIG, **config}
+    growth = planner.last_growth or {}
+    owed_s = int(round(float(growth["backlog_h"]) * 3600)) if "backlog_h" in growth else None
+    threshold_s = int(round(float(growth["trigger_h"]) * 3600)) if "trigger_h" in growth else None
+    adaptive = bool(cfg.get("adaptive_enabled"))
+    target_s = owed_s if adaptive else int(round(float(cfg.get("target_hours_per_day", 2.0)) * 3600))
+    return {
+        "mode": "adaptive" if adaptive else "fixed",
+        "target_s": target_s,
+        "growth": {
+            "owed_s": owed_s,
+            "threshold_s": threshold_s,
+            "informational": not adaptive,
+        },
+    }
+
+
+def _cached_status_response() -> Optional[dict]:
+    if _status_snapshot is None or _status_snapshot_at is None:
+        return None
+    cached = dict(_status_snapshot)
+    fetched_at = _status_snapshot_at.astimezone().isoformat(timespec="seconds")
+    cfg = planner_load_config()
+    cached.update(
+        {
+            "connected": False,
+            "fetched_at": fetched_at,
+            "source": "cached",
+            "age_s": max(0, int((dt.datetime.now().astimezone() - _status_snapshot_at).total_seconds())),
+            "planner": {
+                "state": _planner_public_state(cfg),
+                "inhibit": _planner_public_inhibit(cfg),
+            },
+            "daily_target": _daily_target_status(cfg),
+            "winter_mode": bool(cfg.get("winter_mode")),
+        }
+    )
+    return cached
+
+
 def _smart_context_text(
     active_end_dt: Optional[dt.datetime],
     activity: Optional[MowerActivity],
@@ -1027,9 +1159,27 @@ def _smart_context_text(
 
 @app.get("/api/status")
 async def get_status():
-    """Query all relevant status information from the mower."""
-    _require_connection()
+    """Return live mower status, or an explicitly labelled cached snapshot."""
+    if not _connected or _mower is None or not _mower.is_connected():
+        cached = _cached_status_response()
+        if cached is not None:
+            return cached
+        _require_connection()
 
+    try:
+        return await _read_status()
+    except HTTPException:
+        raise
+    except Exception as exc:
+        cached = _cached_status_response()
+        if cached is not None:
+            logger.warning("Mower status read failed; serving cached data: %s", exc)
+            return cached
+        raise HTTPException(503, "Failed to retrieve mower status") from exc
+
+
+async def _read_status() -> dict:
+    global _status_snapshot, _status_snapshot_at
     state = await _mower.mower_state()
     activity = await _mower.mower_activity()
     battery = await _mower.battery_level()
@@ -1127,8 +1277,8 @@ async def get_status():
         smart_context = _smart_context_text(active_end_dt, activity, remaining_charging_min)
 
     smart_context = _winter_context_text(_planner_cfg) or smart_context
-
-    return {
+    _status_snapshot_at = dt.datetime.now().astimezone()
+    _status_snapshot = {
         "connected": True,
         "address": _mower.address,
         "mower_name": mower_name,
@@ -1138,11 +1288,17 @@ async def get_status():
         "supports_cutting_height": supports_cutting_height,
         "state": state.name if state is not None else None,
         "state_description": _state_description(state),
-        "activity": activity.name if activity is not None else None,
+        "raw_activity": activity.name if activity is not None else None,
+        "activity": _status_activity(activity, state, error_code),
         "activity_description": _activity_description(activity),
         "mode": mode_name,
         "control_mode": control_mode,
         "smart_context": smart_context,
+        "planner": {
+            "state": _planner_public_state(_planner_cfg),
+            "inhibit": _planner_public_inhibit(_planner_cfg),
+        },
+        "daily_target": _daily_target_status(_planner_cfg),
         "winter_mode": bool(_planner_cfg.get("winter_mode")),
         "user_inhibited": planner._user_inhibited if _planner_active else False,
         "restriction_reason": restriction_reason,
@@ -1153,7 +1309,12 @@ async def get_status():
         "estimated_next_start_time": estimated_next_start.isoformat() if estimated_next_start else None,
         "error_code": error_code,
         "error_name": error_name,
+        "fetched_at": _status_snapshot_at.isoformat(timespec="seconds"),
+        "source": "demo" if _demo else "live",
+        "age_s": 0,
+        "demo": _demo,
     }
+    return dict(_status_snapshot)
 
 
 _BLADE_REPLACEMENT_INTERVAL_H = 200  # Husqvarna recommended blade interval (hours)
@@ -1455,14 +1616,13 @@ async def command_mow(req: MowRequest):
     Classic mode: raw SetOverrideMow — firmware parks when the override expires.
     """
     _require_connection()
-    if req.duration_hours <= 0:
-        raise HTTPException(422, "duration_hours must be > 0")
+    _validate_manual_duration(req.duration_hours)
     _cfg = planner_load_config()
     _smart = bool(_cfg.get("enabled"))
     logger.info("CMD mow: duration=%.1f h  mode=%s  mower=%s",
                 req.duration_hours, "smart" if _smart else "classic", _mower.address)
     if _smart:
-        planner._user_inhibited = False
+        planner.clear_user_inhibit()
         # Replace any existing active session with a synthetic one so the executor
         # parks at the right time (end of this manual override) and not sooner.
         _now = dt.datetime.now()
@@ -1498,7 +1658,7 @@ async def command_pause():
     _smart = bool(_cfg.get("enabled"))
     logger.info("CMD pause  mode=%s  mower=%s", "smart" if _smart else "classic", _mower.address)
     if _smart:
-        planner._user_inhibited = True
+        planner.set_user_inhibit("paused_by_user")
         logger.info("CMD pause: set user inhibit — executor will skip sessions until resumed")
     await _mower.mower_pause()
     _log_event("command", "pause")
@@ -1531,7 +1691,7 @@ async def command_resume():
     logger.info("CMD resume  mode=%s  mower=%s", "smart" if _smart else "classic", _mower.address)
 
     if _smart:
-        planner._user_inhibited = False
+        planner.clear_user_inhibit()
         logger.info("CMD resume: cleared user inhibit")
 
     if _smart and planner._active_session:
@@ -1629,7 +1789,7 @@ async def command_park_home():
     _smart = bool(_cfg.get("enabled"))
     logger.info("CMD park_home  mode=%s  mower=%s", "smart" if _smart else "classic", _mower.address)
     if _smart:
-        planner._user_inhibited = True
+        planner.set_user_inhibit("parked_until_resumed")
         planner._active_session = None  # cancel any in-progress session tracking
         logger.info("CMD park_home: set user inhibit + cleared active session")
     await _mower.mower_park_home()
@@ -1653,20 +1813,24 @@ async def command_park_duration(req: ParkDurationRequest):
     Classic mode: raw SetOverridePark — firmware resumes its own schedule after expiry.
     """
     _require_connection()
-    if req.duration_hours <= 0:
-        raise HTTPException(422, "duration_hours must be > 0")
+    _validate_manual_duration(req.duration_hours)
     _cfg = planner_load_config()
     _smart = bool(_cfg.get("enabled"))
     logger.info("CMD park_duration  mode=%s  h=%.2f  mower=%s",
                 "smart" if _smart else "classic", req.duration_hours, _mower.address)
     if _smart:
-        planner._user_inhibited = True
         duration_sec = req.duration_hours * 3600
+        inhibit_until = dt.datetime.now() + dt.timedelta(seconds=duration_sec)
+        planner.set_user_inhibit("parked_until", inhibit_until)
 
         async def _auto_clear_inhibit():
             await asyncio.sleep(duration_sec)
-            if planner._user_inhibited:
-                planner._user_inhibited = False
+            if (
+                planner._user_inhibited
+                and planner._user_inhibit_reason == "parked_until"
+                and planner._user_inhibit_until == inhibit_until
+            ):
+                planner.clear_user_inhibit()
                 logger.info("CMD park_duration: auto-cleared user inhibit after %.0f s", duration_sec)
 
         asyncio.create_task(_auto_clear_inhibit())
@@ -2197,18 +2361,31 @@ async def delete_session(session_id: int):
 
 
 # ─── Weather Watchdog API ─────────────────────────────────────────────────────
+def _offset_timestamp(value: Optional[str]) -> Optional[str]:
+    if not value:
+        return None
+    try:
+        parsed = dt.datetime.fromisoformat(value)
+    except ValueError:
+        return value
+    return parsed.astimezone().isoformat(timespec="seconds")
+
 
 @app.get("/api/watchdog/status")
 async def get_watchdog_status():
-    """Return the weather watchdog's current state and last observed weather."""
-    cfg = planner_load_config()
+    """Return the watchdog's public C-11 state and legacy diagnostics."""
+    cfg = {**PLANNER_DEFAULT_CONFIG, **planner_load_config()}
+    public = watchdog.public_status(cfg)
     return {
-        "enabled": cfg.get("watchdog_enabled", False),
+        "state": public["state"],
+        "last_check": _offset_timestamp(public["last_check"]),
+        "next_action_at": _offset_timestamp(public["next_action_at"]),
+        "mode": "smart" if cfg.get("enabled") else "classic",
+        "enabled": bool(cfg.get("watchdog_enabled")),
         "interval_minutes": cfg.get("watchdog_interval_minutes", 5),
         "dry_delay_minutes": cfg.get("watchdog_dry_delay_minutes", 0),
         "running": watchdog.is_running(),
         "parked_by_watchdog": watchdog._parked_by_watchdog,
-        "last_check": watchdog.last_check,
         "last_status": watchdog.last_status,
         "last_weather": watchdog.last_weather,
     }

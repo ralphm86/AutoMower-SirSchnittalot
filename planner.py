@@ -1265,10 +1265,26 @@ class PlannerAgent:
         # (completed sessions from history + any ongoing session tracked by
         # the sampler).  Used to deduct already-mowed time from today's target.
         self._mow_today_provider: Optional[Callable] = None
-        # Set to True when the user manually parks the mower in Smart mode.
-        # The executor skips dispatching sessions while this is True.
-        # Cleared when the user issues a Resume command.
+        # Set when the user manually pauses or parks in Smart mode.  The public
+        # reason is kept separate from the executor's simple boolean gate.
         self._user_inhibited: bool = False
+        self._user_inhibit_reason: Optional[str] = None
+        self._user_inhibit_until: Optional[dt.datetime] = None
+        self._planning: bool = False
+
+    def set_user_inhibit(
+        self,
+        reason: str,
+        until: Optional[dt.datetime] = None,
+    ) -> None:
+        self._user_inhibited = True
+        self._user_inhibit_reason = reason
+        self._user_inhibit_until = until
+
+    def clear_user_inhibit(self) -> None:
+        self._user_inhibited = False
+        self._user_inhibit_reason = None
+        self._user_inhibit_until = None
 
     def set_mower_provider(self, provider: Callable) -> None:
         """Register a callable that returns the current Mower (or None)."""
@@ -1384,10 +1400,18 @@ class PlannerAgent:
                     await task
                 except asyncio.CancelledError:
                     pass
+        self._planning = False
         logger.info("PlannerAgent stopped")
 
     async def run_once(self) -> str:
         """Fetch weather, compute plan, push to mower. Returns status string."""
+        self._planning = True
+        try:
+            return await self._run_once()
+        finally:
+            self._planning = False
+
+    async def _run_once(self) -> str:
         config = load_config()
 
         if config.get("winter_mode"):
@@ -1893,6 +1917,43 @@ class WeatherWatchdog:
 
     def is_running(self) -> bool:
         return bool(self._bg_task and not self._bg_task.done())
+
+    def public_status(self, config: dict) -> dict:
+        """Return the watchdog's C-11 state without exposing control internals."""
+        if not config.get("watchdog_enabled") or config.get("winter_mode"):
+            return {
+                "state": "disabled",
+                "last_check": self.last_check,
+                "next_action_at": None,
+            }
+
+        next_action: Optional[dt.datetime] = None
+        if self._parked_by_watchdog and self._weather_cleared_at is not None:
+            dry_minutes = max(0, int(config.get("watchdog_dry_delay_minutes", 0)))
+            state = "drying_delay"
+            next_action = self._weather_cleared_at + dt.timedelta(minutes=dry_minutes)
+        elif self._parked_by_watchdog:
+            state = "weather_hold"
+        elif any(
+            marker in self.last_status.lower()
+            for marker in ("weather fetch failed", "could not read mower activity")
+        ):
+            state = "unavailable"
+        else:
+            state = "monitoring"
+            if self.last_check:
+                try:
+                    last_check = dt.datetime.fromisoformat(self.last_check)
+                    interval = max(0, int(config.get("watchdog_interval_minutes", 5)))
+                    next_action = last_check + dt.timedelta(minutes=interval)
+                except ValueError:
+                    pass
+
+        return {
+            "state": state,
+            "last_check": self.last_check,
+            "next_action_at": next_action.isoformat(timespec="seconds") if next_action else None,
+        }
 
     def start(self) -> None:
         if not self.is_running():

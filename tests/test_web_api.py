@@ -12,7 +12,7 @@ import bcrypt
 import pytest
 from fastapi.testclient import TestClient
 
-from automower_ble.protocol import MowerActivity
+from automower_ble.protocol import MowerActivity, MowerState
 
 # GPS fixes must carry a plausible (not future) timestamp.
 T0 = int(time.time()) - 3600
@@ -37,7 +37,18 @@ class TestStatus:
         assert r.status_code == 200
         body = r.json()
         assert body["connected"] is True
-        assert body["activity"] == "MOWING"
+        assert body["activity"] == "mowing"
+        assert body["raw_activity"] == "MOWING"
+        assert body["planner"] == {"state": "idle", "inhibit": None}
+        assert body["daily_target"] == {
+            "mode": "fixed",
+            "target_s": 7200,
+            "growth": {"owed_s": None, "threshold_s": None, "informational": True},
+        }
+        assert body["source"] == "live"
+        assert body["age_s"] == 0
+        assert body["fetched_at"]
+        assert body["demo"] is False
         assert body["activity_description"] == "Mowing lawn"
         assert body["battery_level"] == 80
         assert body["charging"] is False
@@ -136,6 +147,184 @@ class TestStatus:
         assert ctx.startswith("Charging until ~")
         assert "mowing until" in ctx
 
+    @pytest.mark.parametrize(
+        ("activity", "state", "error_code", "expected"),
+        [
+            (MowerActivity.MOWING, MowerState.IN_OPERATION, 0, "mowing"),
+            (MowerActivity.GOING_OUT, MowerState.IN_OPERATION, 0, "mowing"),
+            (MowerActivity.CHARGING, MowerState.IN_OPERATION, 0, "charging"),
+            (MowerActivity.GOING_HOME, MowerState.IN_OPERATION, 0, "returning"),
+            (MowerActivity.PARKED, MowerState.RESTRICTED, 0, "parked"),
+            (MowerActivity.STOPPED_IN_GARDEN, MowerState.STOPPED, 0, "paused"),
+            (MowerActivity.PARKED, MowerState.ERROR, 0, "error"),
+            (MowerActivity.PARKED, MowerState.RESTRICTED, 5, "error"),
+            (None, None, None, "unknown"),
+        ],
+    )
+    def test_public_activity_vocabulary(
+        self, web, connected_client, activity, state, error_code, expected
+    ):
+        web._mower.mower_activity.return_value = activity
+        web._mower.mower_state.return_value = state
+        web._mower.command.side_effect = lambda name, **kwargs: {
+            "GetError": error_code,
+        }.get(name, 0 if name == "GetRestrictionReason" else None)
+        assert connected_client.get("/api/status").json()["activity"] == expected
+
+    @pytest.mark.parametrize(
+        ("enabled", "planning", "result", "windows", "expected"),
+        [
+            (False, False, "Never run", True, "idle"),
+            (True, False, "Never run", True, "idle"),
+            (True, True, "Never run", True, "running"),
+            (True, False, "No available time windows configured", False, "invalid_setup"),
+            (True, False, "Weather fetch failed: offline", True, "failed"),
+            (True, False, "Planned 0 session(s) for next 7 days", True, "zero_sessions"),
+            (True, False, "Planned 2 session(s) for next 7 days", True, "ok"),
+        ],
+    )
+    def test_public_planner_state(
+        self,
+        web,
+        connected_client,
+        monkeypatch,
+        enabled,
+        planning,
+        result,
+        windows,
+        expected,
+    ):
+        monkeypatch.setattr(
+            web,
+            "planner_load_config",
+            lambda: {
+                "enabled": enabled,
+                "available_windows": [{}] if windows else [],
+            },
+        )
+        web.planner._planning = planning
+        web.planner.last_result = result
+        assert connected_client.get("/api/status").json()["planner"]["state"] == expected
+
+    def test_public_planner_inhibits_are_distinct(
+        self, web, connected_client, monkeypatch
+    ):
+        import datetime as dt
+
+        cfg = {"enabled": True, "winter_mode": False}
+        monkeypatch.setattr(web, "planner_load_config", lambda: dict(cfg))
+
+        web.planner._user_inhibited = True
+        web.planner._user_inhibit_reason = "paused_by_user"
+        assert connected_client.get("/api/status").json()["planner"]["inhibit"] == "paused_by_user"
+
+        web.planner._user_inhibit_reason = "parked_until_resumed"
+        assert connected_client.get("/api/status").json()["planner"]["inhibit"] == "parked_until_resumed"
+
+        web.planner._user_inhibit_reason = "parked_until"
+        web.planner._user_inhibit_until = dt.datetime.now() + dt.timedelta(hours=1)
+        assert connected_client.get("/api/status").json()["planner"]["inhibit"] == "parked_until"
+
+        web.planner._user_inhibited = False
+        web.watchdog._parked_by_watchdog = True
+        assert connected_client.get("/api/status").json()["planner"]["inhibit"] == "weather_hold"
+
+        cfg["winter_mode"] = True
+        assert connected_client.get("/api/status").json()["planner"]["inhibit"] == "winter"
+
+    def test_adaptive_daily_target_replaces_fixed_target(
+        self, web, connected_client, monkeypatch
+    ):
+        monkeypatch.setattr(
+            web,
+            "planner_load_config",
+            lambda: {
+                "enabled": True,
+                "adaptive_enabled": True,
+                "target_hours_per_day": 2.0,
+            },
+        )
+        web.planner.last_growth = {"backlog_h": 1.5, "trigger_h": 2.3}
+        target = connected_client.get("/api/status").json()["daily_target"]
+        assert target == {
+            "mode": "adaptive",
+            "target_s": 5400,
+            "growth": {"owed_s": 5400, "threshold_s": 8280, "informational": False},
+        }
+
+    def test_status_returns_cached_values_after_disconnect(
+        self, web, connected_client, monkeypatch
+    ):
+        live = connected_client.get("/api/status").json()
+        web._connected = False
+        cached = connected_client.get("/api/status").json()
+        assert cached["connected"] is False
+        assert cached["source"] == "cached"
+        assert cached["fetched_at"] == live["fetched_at"]
+        assert cached["age_s"] >= 0
+        assert cached["battery_level"] == live["battery_level"]
+
+    def test_failed_live_read_falls_back_to_labelled_cache(
+        self, web, connected_client, monkeypatch
+    ):
+        live = connected_client.get("/api/status").json()
+        web._mower.mower_state.side_effect = RuntimeError("BLE read failed")
+        cached = connected_client.get("/api/status").json()
+        assert cached["source"] == "cached"
+        assert cached["connected"] is False
+        assert cached["fetched_at"] == live["fetched_at"]
+
+    def test_demo_source_is_backend_owned(self, web, connected_client, monkeypatch):
+        monkeypatch.setattr(web, "_demo", True)
+        body = connected_client.get("/api/status").json()
+        assert body["source"] == "demo"
+        assert body["demo"] is True
+
+
+# ─── Watchdog contract ────────────────────────────────────────────────────────
+class TestWatchdogContract:
+    def test_watchdog_states_are_explicit_and_timezoned(
+        self, web, client, monkeypatch
+    ):
+        import datetime as dt
+
+        cfg = {
+            "enabled": True,
+            "watchdog_enabled": False,
+            "watchdog_interval_minutes": 5,
+            "watchdog_dry_delay_minutes": 10,
+        }
+        monkeypatch.setattr(web, "planner_load_config", lambda: dict(cfg))
+
+        disabled = client.get("/api/watchdog/status").json()
+        assert disabled["state"] == "disabled"
+        assert disabled["next_action_at"] is None
+        assert disabled["mode"] == "smart"
+
+        cfg["watchdog_enabled"] = True
+        web.watchdog.last_check = dt.datetime.now().isoformat(timespec="seconds")
+        web.watchdog.last_status = "Weather OK: clear"
+        monitoring = client.get("/api/watchdog/status").json()
+        assert monitoring["state"] == "monitoring"
+        assert monitoring["next_action_at"] is not None
+        assert dt.datetime.fromisoformat(monitoring["last_check"]).utcoffset() is not None
+
+        web.watchdog._parked_by_watchdog = True
+        held = client.get("/api/watchdog/status").json()
+        assert held["state"] == "weather_hold"
+        assert held["next_action_at"] is None
+
+        web.watchdog._weather_cleared_at = dt.datetime.now() - dt.timedelta(minutes=3)
+        drying = client.get("/api/watchdog/status").json()
+        assert drying["state"] == "drying_delay"
+        assert dt.datetime.fromisoformat(drying["next_action_at"]).utcoffset() is not None
+
+        web.watchdog._parked_by_watchdog = False
+        web.watchdog._weather_cleared_at = None
+        web.watchdog.last_status = "Weather fetch failed: offline"
+        unavailable = client.get("/api/watchdog/status").json()
+        assert unavailable["state"] == "unavailable"
+
 
 # ─── Connection lifecycle ─────────────────────────────────────────────────────
 class TestConnection:
@@ -219,6 +408,8 @@ class TestSmartCommands:
         assert r.status_code == 200
         assert r.json()["control_mode"] == "smart"
         assert smart._user_inhibited is False
+        assert smart._user_inhibit_reason is None
+        assert smart._user_inhibit_until is None
         assert smart._active_session is not None
         assert smart._active_session["dow_name"] == "Manual"
         assert smart._active_session["duration_sec"] == int(1.5 * 3600)
@@ -227,12 +418,33 @@ class TestSmartCommands:
         r = connected_client.post("/api/command/pause")
         assert r.status_code == 200
         assert smart._user_inhibited is True
+        assert smart._user_inhibit_reason == "paused_by_user"
+        assert smart._user_inhibit_until is None
 
     def test_resume_clears_user_inhibit(self, connected_client, web, smart):
-        smart._user_inhibited = True
+        smart.set_user_inhibit("parked_until_resumed")
         r = connected_client.post("/api/command/resume")
         assert r.status_code == 200
         assert smart._user_inhibited is False
+        assert smart._user_inhibit_reason is None
+        assert smart._user_inhibit_until is None
+
+    def test_timed_park_exposes_until_reason(
+        self, connected_client, web, smart, monkeypatch
+    ):
+        import datetime as dt
+
+        def close_coroutine(coro):
+            coro.close()
+            return object()
+
+        monkeypatch.setattr(web.asyncio, "create_task", close_coroutine)
+        r = connected_client.post(
+            "/api/command/park_duration", json={"duration_hours": 0.25}
+        )
+        assert r.status_code == 200
+        assert smart._user_inhibit_reason == "parked_until"
+        assert smart._user_inhibit_until > dt.datetime.now()
 
     def test_park_no_active_session_is_noop(self, connected_client, web, smart):
         r = connected_client.post("/api/command/park")
@@ -260,7 +472,38 @@ class TestSmartCommands:
         r = connected_client.post("/api/command/park_home")
         assert r.status_code == 200
         assert smart._user_inhibited is True
+        assert smart._user_inhibit_reason == "parked_until_resumed"
+        assert smart._user_inhibit_until is None
         assert smart._active_session is None
+
+
+# ─── Capability and duration contract ─────────────────────────────────────────
+class TestCapabilitiesAndDurations:
+    def test_capabilities_are_explicit(self, client):
+        body = client.get("/api/capabilities").json()
+        assert body == {
+            "commands": ["mow", "pause", "resume", "park", "park_home", "park_duration"],
+            "min_manual_duration_min": 15,
+            "max_manual_duration_min": 720,
+        }
+
+    @pytest.mark.parametrize("path", ["/api/command/mow", "/api/command/park_duration"])
+    @pytest.mark.parametrize("duration", [0.0, 0.249, 12.001])
+    def test_manual_duration_limits_are_structured(self, connected_client, path, duration):
+        response = connected_client.post(path, json={"duration_hours": duration})
+        assert response.status_code == 422
+        assert response.json()["detail"] == {
+            "field": "duration_hours",
+            "min": 0.25,
+            "max": 12.0,
+        }
+
+    @pytest.mark.parametrize("path", ["/api/command/mow", "/api/command/park_duration"])
+    @pytest.mark.parametrize("duration", [0.25, 12.0])
+    def test_manual_duration_boundaries_are_accepted(
+        self, connected_client, path, duration
+    ):
+        assert connected_client.post(path, json={"duration_hours": duration}).status_code == 200
 
 
 # ─── Schedule ─────────────────────────────────────────────────────────────────

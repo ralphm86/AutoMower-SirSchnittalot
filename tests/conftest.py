@@ -115,6 +115,24 @@ def web(monkeypatch):
     monkeypatch.setattr(web_app, "_reconnect_cfg", None, raising=False)
     monkeypatch.setattr(web_app, "_reconnect_enabled", False, raising=False)
     monkeypatch.setattr(web_app, "_server_start_time", dt.datetime.now(), raising=False)
+    monkeypatch.setattr(web_app, "_status_snapshot", None, raising=False)
+    monkeypatch.setattr(web_app, "_status_snapshot_at", None, raising=False)
+
+    monkeypatch.setattr(web_app.planner, "_planning", False, raising=False)
+    monkeypatch.setattr(web_app.planner, "last_result", "Never run", raising=False)
+    monkeypatch.setattr(web_app.planner, "last_run", None, raising=False)
+    monkeypatch.setattr(web_app.planner, "last_growth", {}, raising=False)
+    monkeypatch.setattr(web_app.planner, "last_log", [], raising=False)
+    monkeypatch.setattr(web_app.planner, "_planned_sessions", [], raising=False)
+    monkeypatch.setattr(web_app.planner, "_active_session", None, raising=False)
+    monkeypatch.setattr(web_app.planner, "_user_inhibited", False, raising=False)
+    monkeypatch.setattr(web_app.planner, "_user_inhibit_reason", None, raising=False)
+    monkeypatch.setattr(web_app.planner, "_user_inhibit_until", None, raising=False)
+    monkeypatch.setattr(web_app.watchdog, "_parked_by_watchdog", False, raising=False)
+    monkeypatch.setattr(web_app.watchdog, "_weather_cleared_at", None, raising=False)
+    monkeypatch.setattr(web_app.watchdog, "last_check", None, raising=False)
+    monkeypatch.setattr(web_app.watchdog, "last_status", "Never checked", raising=False)
+    monkeypatch.setattr(web_app.watchdog, "last_weather", None, raising=False)
 
     return web_app
 

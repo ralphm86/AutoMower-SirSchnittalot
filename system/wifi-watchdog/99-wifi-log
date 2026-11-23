@@ -1,0 +1,24 @@
+#!/bin/bash
+#
+# NetworkManager dispatcher script: logs every state transition of wlan0
+# (up/down/pre-up/pre-down/hostname/dhcp4-change/...) with a timestamp to a
+# persistent log file, independent of the kernel ring buffer.
+#
+# This captures the *exact moment and reason* of a disconnect as it happens,
+# so nothing is lost even if the Pi loses power right after.
+#
+# Install: copy to /etc/NetworkManager/dispatcher.d/99-wifi-log
+#          chmod +x /etc/NetworkManager/dispatcher.d/99-wifi-log
+# NetworkManager calls this automatically on every connection state change.
+
+IFACE="$1"
+STATUS="$2"
+LOG_FILE="/var/log/wifi-events.log"
+
+if [[ "$IFACE" == "wlan0" ]]; then
+    {
+        echo "$(date '+%Y-%m-%d %H:%M:%S') wlan0 event=$STATUS"
+        iw dev "$IFACE" link 2>&1
+    } >> "$LOG_FILE"
+    logger -t wifi-events "wlan0 event=$STATUS"
+fi
